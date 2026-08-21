@@ -1,0 +1,12 @@
+#!/bin/sh
+# Dev launcher.
+#
+# This repo lives under ~/Desktop, where macOS keeps re-applying the UF_HIDDEN
+# file flag to everything inside .venv -- and CPython's site.addpackage()
+# silently skips *hidden* .pth files. That makes `uv pip install -e .` inert:
+# the editable path never reaches sys.path. Running from src/ sidesteps it
+# entirely. See README "Known environment gotcha".
+here=$(cd "$(dirname "$0")" && pwd)
+PYTHONPATH="$here/src${PYTHONPATH:+:$PYTHONPATH}" \
+PYTHONWARNINGS="${PYTHONWARNINGS:-ignore}" \
+exec "$here/.venv/bin/python" -m q_audit "$@"

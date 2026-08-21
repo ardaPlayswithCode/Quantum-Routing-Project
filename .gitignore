@@ -216,3 +216,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# q-audit benchmark artifacts (golden.json IS tracked)
+benchmarks/results/
