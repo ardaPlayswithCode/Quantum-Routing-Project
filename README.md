@@ -1,4 +1,4 @@
-# q-audit — quantum transpile audit
+# q-audit — quantum routing project
 
 `q-audit` transpiles a circuit **twice** against the same backend and shows you the
 difference side by side:
