@@ -1,6 +1,4 @@
-"""Calibration ingestion, the T2 clamp, the cache and the staleness policy."""
-
-from __future__ import annotations
+"""loading calibration, the T2 clamp, the cache, the staleness rules"""
 
 import datetime as _dt
 
@@ -8,14 +6,16 @@ import pytest
 
 from q_audit.calibration import (
     CACHE_TTL_SECONDS,
+    CalibrationSnapshot,
+    QubitCal,
     check_staleness,
+    clamp_snapshot_t2,
     load_fake_backend,
     load_from_cache,
     save_to_cache,
     snapshot_from_target,
 )
 from q_audit.errors import CalibrationError, StaleCalibrationError
-from q_audit.models import CalibrationSnapshot, EdgeCal, QubitCal, clamp_snapshot_t2
 
 SHERBROOKE_QUBITS = 127
 SHERBROOKE_COUPLERS = 144
@@ -54,7 +54,7 @@ def test_edge_lookup_is_direction_tolerant(snapshot):
 
 def test_median_two_qubit_duration_is_sane(snapshot):
     median = snapshot.median_two_qubit_duration()
-    assert 1e-7 < median < 1e-5  # hundreds of nanoseconds
+    assert 1e-7 < median < 1e-5  # should be a few hundred ns
 
 
 def test_t2_clamp_applied_on_ingest():
@@ -72,7 +72,7 @@ def test_snapshot_json_round_trip(snapshot):
 
 
 def test_snapshot_is_hashable(snapshot):
-    """Qiskit's MetaPass hashes every pass __init__ argument."""
+    # qiskit hashes every pass argument so this has to work
     assert isinstance(hash(snapshot), int)
 
 
@@ -80,7 +80,7 @@ def test_fake_backend_reports_its_true_capture_date():
     snap, backend = load_fake_backend("fake_sherbrooke")
     assert snap.source == "fake_backend"
     assert backend.num_qubits == SHERBROOKE_QUBITS
-    # The shipped calibration is a frozen file, not "now".
+    # the shipped calibration is a file from months ago, not now
     assert snap.captured_at.year <= _dt.datetime.now(_dt.timezone.utc).year
     assert snap.age_hours() > 0
 
@@ -94,7 +94,7 @@ def test_fake_backend_name_normalisation():
 def test_unknown_fake_backend_raises_with_suggestions():
     with pytest.raises(CalibrationError) as exc:
         load_fake_backend("fake_not_a_real_machine")
-    assert "Unknown fake backend" in exc.value.message
+    assert "couldn't find a fake backend" in exc.value.message
     assert exc.value.hint
 
 
@@ -151,10 +151,10 @@ def test_staleness_accepts_fresh_live_data(snapshot):
 
 
 def test_staleness_warns_but_never_refuses_a_reference_snapshot(snapshot):
-    """A fake backend is frozen by design; refusing it would break offline use."""
+    """fake backends are frozen on purpose, refusing them breaks offline use"""
     warnings = check_staleness(snapshot, allow_stale=False)
     assert len(warnings) == 1
-    assert "Offline reference snapshot" in warnings[0]
+    assert "offline reference snapshot" in warnings[0]
 
 
 def test_snapshot_from_target_handles_missing_qubit_properties(target):

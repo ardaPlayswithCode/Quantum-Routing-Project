@@ -1,6 +1,4 @@
-"""ESP measurement, SWAP counting and layout extraction."""
-
-from __future__ import annotations
+"""esp measurement, swap counting, layout extraction"""
 
 import pytest
 from qiskit import QuantumCircuit
@@ -41,7 +39,7 @@ def test_instruction_error_lookup(snapshot):
     assert instruction_error(snapshot, "barrier", (0,)) == 0.0
     edge = snapshot.edges[0]
     assert instruction_error(snapshot, edge.gate, (edge.control, edge.target)) == edge.error
-    # Reversed direction resolves to the same coupler.
+    # reversed direction is the same coupler
     assert instruction_error(snapshot, edge.gate, (edge.target, edge.control)) == edge.error
 
 
@@ -58,12 +56,12 @@ def test_gate_error_breakdown_is_complete(transpiled, snapshot):
 def test_swap_counter_sees_routing_swaps(transpiled):
     _, counter = transpiled
     assert counter.added >= 0
-    # A 5-qubit line embeds perfectly on heavy-hex, so nothing should be added.
+    # a 5 qubit line fits heavy-hex perfectly so nothing should get added
     assert counter.added == 0
 
 
 def test_swap_counter_counts_when_routing_is_forced(fake_backend):
-    """A fully-connected interaction graph cannot embed; SABRE must add SWAPs."""
+    """fully connected graph can't embed so sabre has to add swaps"""
     qc = QuantumCircuit(6)
     for i in range(6):
         for j in range(i + 1, 6):
@@ -91,7 +89,7 @@ def test_compute_metrics_is_self_consistent(transpiled, snapshot, target):
     assert 0.0 < metrics.esp <= 1.0
     assert metrics.esp <= metrics.esp_gate_only
     assert metrics.esp <= metrics.esp_idle_only
-    # ESP factorises exactly into its two halves.
+    # esp should factorise exactly into its two halves
     assert metrics.esp == pytest.approx(
         metrics.esp_gate_only * metrics.esp_idle_only, rel=1e-9
     )
@@ -113,8 +111,8 @@ def test_worst_idle_penalty_is_sorted(transpiled, snapshot, target):
 
 
 def test_dead_couplers_are_detected(snapshot, fake_backend):
-    """fake_sherbrooke ships couplers with error == 1.0 and TrivialLayout
-    (optimization_level 0/1) routes a 7-qubit line straight through one."""
+    """sherbrooke ships couplers with error 1.0 and TrivialLayout (opt level
+    0 and 1) routes a 7 qubit line straight through one of them"""
     from qiskit import QuantumCircuit
     from qiskit.transpiler import generate_preset_pass_manager
 

@@ -1,16 +1,13 @@
-"""CANARY SUITE.
+"""canary tests. don't weaken these.
 
-q-audit's entire mechanism rests on one private-ish Qiskit contract: an
-``ErrorMap`` placed at ``property_set["vf2_avg_error_map"]`` steers VF2Layout
-and VF2PostLayout.  Nothing in Qiskit's public API promises this.  If a Qiskit
-upgrade changes it, the audit does not crash -- it silently degrades into
-"transpile the circuit twice and report that nothing changed", which is far
-worse than a failure.
+the whole tool rests on one thing: an ErrorMap put at
+property_set["vf2_avg_error_map"] steers VF2Layout and VF2PostLayout. nothing
+in qiskit's public api promises that. if an upgrade changes it the audit
+doesn't crash, it turns into "transpile the circuit twice and report that
+nothing changed", which is much worse than crashing.
 
-These tests exist to make that failure loud.  Do not weaken them.
+these tests are here to make that fail loudly instead
 """
-
-from __future__ import annotations
 
 import pytest
 from qiskit import QuantumCircuit
@@ -27,7 +24,7 @@ class _Inject(AnalysisPass):
         super().__init__()
         self._map = error_map
 
-    def __hash__(self):  # Qiskit hashes every pass __init__ argument.
+    def __hash__(self):  # qiskit hashes every pass argument
         return id(self)
 
     def run(self, dag):
@@ -84,8 +81,8 @@ def _vf2_layout(circuit, target, error_map, seed=42):
 
 @pytest.fixture
 def line5(snapshot):
-    """A 5-qubit line: embeds into heavy-hex many different ways, so the
-    layout VF2 picks is decided purely by the error map."""
+    """5 qubit line. embeds into heavy-hex loads of different ways so whichever
+    one vf2 picks is decided entirely by the error map"""
     from q_audit.feature_extract import unroll_to_basis
 
     qc = QuantumCircuit(5)
@@ -96,23 +93,23 @@ def line5(snapshot):
 
 
 # ---------------------------------------------------------------------------
-# The contract itself
+# the contract itself
 # ---------------------------------------------------------------------------
 
 
 def test_errormap_injection_contract(line5, snapshot, target):
-    """THE canary: ErrorMap still works and still steers VF2Layout."""
-    # 1. ErrorMap's API is unchanged.
+    """the main canary. ErrorMap still works and still steers VF2Layout"""
+    # 1. the ErrorMap api hasn't changed
     error_map = ErrorMap(2)
     error_map.add_error((0, 0), 0.25)
     assert error_map.get((0, 0)) == pytest.approx(0.25)
     assert len(error_map) == 1
 
-    # 2. The property-set key is still read by both VF2 passes.
+    # 2. both vf2 passes still read the property set key
     assert error_map_is_supported()
 
-    # 3. Injection actually changes the answer, and changes it *to* the region
-    #    we favoured -- not merely to "something different".
+    # 3. injecting actually changes the answer, and changes it TO the region we
+    #    favoured. "something different" isn't good enough, that could be luck
     island_a = _neighbourhood(snapshot.coupling, 100, 4)
     island_b = _neighbourhood(snapshot.coupling, 20, 4)
     assert not (island_a & island_b), "islands must be disjoint for this test to mean anything"
@@ -127,7 +124,7 @@ def test_errormap_injection_contract(line5, snapshot, target):
 
 
 def test_uninjected_and_injected_layouts_differ(line5, snapshot, target):
-    """Without injection VF2 uses Qiskit's own map; ours must be able to win."""
+    """with no injection vf2 uses qiskit's own map, ours has to be able to beat it"""
     default = _vf2_layout(line5, target, None)
     island = _neighbourhood(snapshot.coupling, 20, 4)
     injected = _vf2_layout(line5, target, _skewed_map(snapshot, island))
@@ -140,7 +137,7 @@ def test_property_set_key_name_is_stable():
 
 
 # ---------------------------------------------------------------------------
-# VF2PostLayout: the strict_direction trap
+# VF2PostLayout and the strict_direction trap
 # ---------------------------------------------------------------------------
 
 
@@ -181,7 +178,7 @@ def routed_line5(fake_backend):
 def test_vf2_post_layout_non_strict_responds_to_injection(
     routed_line5, snapshot, target
 ):
-    """strict_direction=False is the branch that consumes ``vf2_avg_error_map``."""
+    """strict_direction=False is the only branch that reads vf2_avg_error_map"""
     island = _neighbourhood(snapshot.coupling, 100, 4)
     assert not (island & {0, 1, 2, 3, 4})
 
@@ -197,12 +194,12 @@ def test_vf2_post_layout_non_strict_responds_to_injection(
 
 
 def test_vf2_post_layout_strict_ignores_injection(routed_line5, snapshot, target):
-    """The strict branch scores against the target directly.
+    """the strict branch scores against the target directly and ignores us.
 
-    This is a trap, not a bug: if q-audit ever let a strict VF2PostLayout run
-    after choosing a layout, it would silently discard the whole injection.
-    That is why the audited path pins ``initial_layout`` (which removes every
-    VF2PostLayout from the preset pass manager).
+    this is a trap not a bug. if we ever let a strict VF2PostLayout run after
+    picking a layout it would throw the whole injection away without saying
+    anything. that's why the audited path pins initial_layout, which strips
+    every VF2PostLayout out of the preset
     """
     island = _neighbourhood(snapshot.coupling, 100, 4)
     strict_injected, _ = _post_layout(
@@ -219,7 +216,7 @@ def test_vf2_post_layout_strict_ignores_injection(routed_line5, snapshot, target
 
 
 def test_preset_drops_vf2_post_layout_when_initial_layout_is_pinned(fake_backend):
-    """Guards the assumption the audited path is built on."""
+    """guards the assumption the whole pinned strategy is built on"""
 
     def pass_names(pm):
         found: list[str] = []
@@ -255,24 +252,21 @@ def test_preset_drops_vf2_post_layout_when_initial_layout_is_pinned(fake_backend
 
 
 # ---------------------------------------------------------------------------
-# How the diagonal is weighted (drives our "normalized" scaling)
+# how vf2 weights the diagonal, which is where map_scaling=normalized comes from
 # ---------------------------------------------------------------------------
 
 
 def test_vf2_diagonal_exponent_is_one_qubit_op_count(snapshot, target):
-    """The diagonal is a *per-1q-op* rate, not a per-qubit total.
+    """the diagonal is a per 1q op rate, not a per qubit total.
 
-    VF2 scores an embedding as ``prod_q (1-diag[q])**n1q(q)``.  We pit two
-    candidate couplers against each other:
+    vf2 scores an embedding as prod_q (1-diag[q])**n1q(q). so put two couplers
+    against each other. E1 has diag 0.010 each and edge 0.001, E2 has diag
+    0.005 each and edge 0.020. E1 wins while there are few 1q ops and E2 wins
+    once the diagonal has been exponentiated enough. crossover works out at
+    n = 3.81 so E1 should win at n<=3 and E2 at n>=4.
 
-        E1: diag 0.010 each, edge 0.001   -- wins when few 1q ops
-        E2: diag 0.005 each, edge 0.020   -- wins once the diagonal is
-                                             exponentiated enough
-
-    The closed-form crossover is n = 3.81, so E1 must win at n<=3 and E2 at
-    n>=4.  If Qiskit ever changes to applying the diagonal once, E1 wins for
-    every n and this test fails -- at which point ``map_scaling="normalized"``
-    is wrong and must be revisited.
+    if qiskit ever switches to applying the diagonal once then E1 wins for
+    every n and this fails, and at that point map_scaling="normalized" is wrong
     """
     edges = sorted({(min(a, b), max(a, b)) for a, b in snapshot.coupling})
     e1, e2 = edges[5], edges[20]
@@ -311,7 +305,7 @@ def test_vf2_diagonal_exponent_is_one_qubit_op_count(snapshot, target):
 
 
 def test_barriers_do_not_count_toward_the_exponent(snapshot, target):
-    """Sanity check on the same mechanism; guards ``dag_op_stats``."""
+    """same mechanism, sanity check on dag_op_stats"""
     from q_audit.feature_extract import dag_op_stats
 
     qc = QuantumCircuit(2)
@@ -320,6 +314,6 @@ def test_barriers_do_not_count_toward_the_exponent(snapshot, target):
     qc.barrier()
     qc.ecr(0, 1)
     stats = dag_op_stats(qc)
-    assert stats.one_qubit_ops == 2  # sx + rz, barrier excluded
-    assert stats.error_bearing_1q_ops == 1  # only sx carries error
+    assert stats.one_qubit_ops == 2  # sx + rz, barrier doesn't count
+    assert stats.error_bearing_1q_ops == 1  # rz is free
     assert stats.active_qubits == 2

@@ -1,21 +1,16 @@
-"""Aer validation harness. DEV-ONLY -- never imported on the optimizer path.
+"""aer simulation harness. dev only, never imported on the optimizer path.
 
-``qiskit-aer`` is an optional dependency; every import of it lives inside a
-function body here so that ``q-audit run`` works on a machine without Aer.
+qiskit-aer is an optional dependency so every import of it happens inside a
+function, that way `q-audit run` still works on a machine without aer.
 
-Why padding matters
--------------------
-Aer applies noise per *instruction*.  A transpiled circuit with no explicit
-``delay`` instructions therefore simulates as if idle qubits were perfectly
-preserved -- exactly the effect this tool exists to measure.  So every circuit
-is scheduled and padded with ``PadDelay`` before simulation.  Empirically this
-moves GHZ-7 on fake_sherbrooke from F=0.888 (unpadded) to F=0.838 (padded);
-skipping it would make the benchmark blind to decoherence.
+the padding matters more than you'd think. aer applies noise per instruction,
+so a transpiled circuit with no explicit delays simulates as if idle qubits
+were perfectly preserved, which is exactly the effect this whole tool is about.
+so we schedule and PadDelay everything before simulating. on ghz7 that moves
+fidelity from 0.888 (unpadded) to 0.838 (padded). without it the benchmark is
+blind to decoherence
 """
 
-from __future__ import annotations
-
-from qiskit import QuantumCircuit
 from qiskit.transpiler import PassManager
 from qiskit.transpiler.passes import (
     ALAPScheduleAnalysis,
@@ -37,37 +32,35 @@ class AerUnavailableError(QAuditError):
 
 def require_aer():
     try:
-        import qiskit_aer  # noqa: F401
+        import qiskit_aer
     except ImportError as exc:
         raise AerUnavailableError(
-            "qiskit-aer is not installed; --verify and the benchmarks need it.",
+            "qiskit-aer isn't installed, --verify and the benchmarks need it",
             hint="uv pip install 'qiskit-aer==0.17.2'",
         ) from exc
     return qiskit_aer
 
 
-def ideal_distribution(circuit: QuantumCircuit) -> dict[str, float]:
-    """Exact output distribution of the *logical* circuit, noise-free.
+def ideal_distribution(circuit):
+    """exact noise free output of the logical circuit.
 
-    Uses a statevector rather than a noiseless shot simulation so the reference
-    carries no sampling error of its own.
+    statevector rather than a noiseless shot run so the reference has no
+    sampling error of its own
     """
     from qiskit.quantum_info import Statevector
 
     if circuit.num_qubits > MAX_STATEVECTOR_QUBITS:
         raise AerUnavailableError(
-            f"Ideal statevector needs <= {MAX_STATEVECTOR_QUBITS} qubits; "
-            f"circuit has {circuit.num_qubits}."
+            f"ideal statevector needs <= {MAX_STATEVECTOR_QUBITS} qubits, "
+            f"this circuit has {circuit.num_qubits}"
         )
     stripped = circuit.remove_final_measurements(inplace=False)
     probs = Statevector(stripped).probabilities_dict()
     return {str(k): float(v) for k, v in probs.items() if v > 1e-12}
 
 
-def pad_for_simulation(
-    circuit: QuantumCircuit, target, *, schedule_method: str = "asap"
-) -> QuantumCircuit:
-    """Materialise idle time as explicit ``delay`` instructions."""
+def pad_for_simulation(circuit, target, *, schedule_method="asap"):
+    """turn idle time into actual delay instructions so aer can see it"""
     analysis = ASAPScheduleAnalysis if schedule_method == "asap" else ALAPScheduleAnalysis
     pm = PassManager(
         [
@@ -79,43 +72,25 @@ def pad_for_simulation(
     return pm.run(circuit)
 
 
-def noisy_counts(
-    circuit: QuantumCircuit,
-    backend,
-    *,
-    shots: int = 8192,
-    seed_simulator: int = 1234,
-    pad: bool = True,
-    schedule_method: str = "asap",
-    noise_model=None,
-) -> dict[str, int]:
+def noisy_counts(circuit, backend, *, shots=8192, seed_simulator=1234, pad=True,
+                 schedule_method="asap", noise_model=None):
     require_aer()
     from qiskit_aer import AerSimulator
     from qiskit_aer.noise import NoiseModel
 
     if noise_model is None:
         noise_model = NoiseModel.from_backend(backend)
-    to_run = (
-        pad_for_simulation(circuit, backend.target, schedule_method=schedule_method)
-        if pad
-        else circuit
-    )
+    if pad:
+        to_run = pad_for_simulation(circuit, backend.target, schedule_method=schedule_method)
+    else:
+        to_run = circuit
     sim = AerSimulator(noise_model=noise_model)
     result = sim.run(to_run, shots=shots, seed_simulator=seed_simulator).result()
     return {str(k): int(v) for k, v in result.get_counts().items()}
 
 
-def simulated_fidelity(
-    transpiled: QuantumCircuit,
-    ideal: dict[str, float],
-    backend,
-    *,
-    shots: int = 8192,
-    seed_simulator: int = 1234,
-    pad: bool = True,
-    schedule_method: str = "asap",
-    noise_model=None,
-) -> tuple[float, dict[str, int]]:
+def simulated_fidelity(transpiled, ideal, backend, *, shots=8192, seed_simulator=1234,
+                       pad=True, schedule_method="asap", noise_model=None):
     counts = noisy_counts(
         transpiled,
         backend,
@@ -128,8 +103,8 @@ def simulated_fidelity(
     return hellinger_fidelity(ideal, {k: float(v) for k, v in counts.items()}), counts
 
 
-def ensure_measured(circuit: QuantumCircuit) -> QuantumCircuit:
-    """Add a full measurement if the circuit has none -- Aer needs counts."""
+def ensure_measured(circuit):
+    """aer needs counts, so add a measurement if there isn't one"""
     if any(inst.operation.name == "measure" for inst in circuit.data):
         return circuit
     copy = circuit.copy()

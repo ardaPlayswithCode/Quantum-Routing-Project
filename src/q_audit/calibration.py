@@ -1,52 +1,208 @@
-"""Calibration ingestion, normalisation and on-disk caching.
+"""calibration data: the models, where we get them from, and the disk cache.
 
-Resolution order (first hit wins):
-    1. ``--backend fake_<name>``  -> offline reference snapshot from
-       ``qiskit_ibm_runtime.fake_provider``.  Fully deterministic, no network.
-    2. on-disk JSON cache under ``platformdirs.user_cache_dir`` (1 hour TTL)
-    3. live ``QiskitRuntimeService``
+we look for calibration in this order: fake backend (offline, no network),
+then the json cache on disk, then live ibm.
 
-We never cache Qiskit objects.  The cache holds ``CalibrationSnapshot`` JSON --
-plain numbers that survive a Qiskit upgrade.
+the models used to live in their own models.py but they're 90% calibration
+numbers so i moved them here.
+
+one rule: never cache qiskit objects. a Target isn't json and doesn't survive
+a qiskit upgrade. the snapshot is just floats, so it does.
 """
-
-from __future__ import annotations
 
 import datetime as _dt
 import json
 import os
 from pathlib import Path
-from typing import Any
 
 from platformdirs import user_cache_dir
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from .errors import CalibrationError, StaleCalibrationError
-from .models import CalibrationSnapshot, EdgeCal, QubitCal, clamp_snapshot_t2
+from .physics import clamp_t2
 
 CACHE_TTL_SECONDS = 3600  # 1 hour
 STALE_LIMIT_HOURS = 24.0
+# which 1q gate to believe for the per qubit error, first one that exists wins
 _ONE_QUBIT_ERROR_PREFERENCE = ("sx", "x", "rx", "sxdg", "u", "u3")
 
 
-def cache_dir() -> Path:
+# ---------------- the models ----------------
+
+
+class QubitCal(BaseModel):
+    """one qubit's numbers. times in seconds, errors are just fractions"""
+
+    model_config = ConfigDict(frozen=True)
+
+    index: int = Field(ge=0)
+    t1: float | None = None
+    t2: float | None = None
+    readout_error: float | None = None
+    sx_error: float | None = None
+    frequency: float | None = None
+
+    @field_validator("t1", "t2")
+    @classmethod
+    def _non_negative_time(cls, v):
+        if v is not None and v < 0:
+            raise ValueError("coherence times must be non-negative")
+        return v
+
+    @property
+    def static_error(self):
+        """the part of a qubit's badness that has nothing to do with idling"""
+        return (self.sx_error or 0.0) + (self.readout_error or 0.0)
+
+    @property
+    def is_complete(self):
+        return None not in (self.t1, self.t2, self.readout_error, self.sx_error)
+
+
+class EdgeCal(BaseModel):
+    """one direction of one coupler"""
+
+    model_config = ConfigDict(frozen=True)
+
+    control: int = Field(ge=0)
+    target: int = Field(ge=0)
+    gate: str
+    error: float | None = None
+    duration: float | None = None
+
+    @property
+    def key(self):
+        return (self.control, self.target)
+
+
+class CalibrationSnapshot(BaseModel):
+    """one backend's calibration, frozen at one moment, all plain numbers"""
+
+    model_config = ConfigDict(frozen=True)
+
+    backend_name: str
+    source: str
+    captured_at: _dt.datetime
+    num_qubits: int
+    dt: float | None = None
+    basis_gates: list[str] = Field(default_factory=list)
+    qubits: list[QubitCal]
+    edges: list[EdgeCal]
+    coupling: list[tuple[int, int]] = Field(default_factory=list)
+
+    # took me ages to work out why passing a snapshot to a pass blew up:
+    # qiskit's MetaPass hashes every __init__ argument, and pydantic's frozen
+    # hash walks __dict__ which has lists in it. so hash the scalars instead.
+    def __hash__(self):
+        return hash(
+            (
+                self.backend_name,
+                self.source,
+                self.captured_at,
+                self.num_qubits,
+                len(self.qubits),
+                len(self.edges),
+            )
+        )
+
+    def qubit(self, index):
+        return self._qubit_index()[index]
+
+    def _qubit_index(self):
+        # lazy dict so we're not doing a linear scan per lookup. frozen model
+        # so it has to go in through object.__setattr__
+        cached = self.__dict__.get("_qmap")
+        if cached is None:
+            cached = {q.index: q for q in self.qubits}
+            object.__setattr__(self, "_qmap", cached)
+        return cached
+
+    def _edge_index(self):
+        cached = self.__dict__.get("_emap")
+        if cached is None:
+            cached = {e.key: e for e in self.edges}
+            object.__setattr__(self, "_emap", cached)
+        return cached
+
+    def edge(self, control, target):
+        # calibration usually only gives one direction per coupler but a routed
+        # circuit can use either, and physically it's the same coupler
+        emap = self._edge_index()
+        hit = emap.get((control, target))
+        if hit is not None:
+            return hit
+        return emap.get((target, control))
+
+    def t1(self, index):
+        return self.qubit(index).t1
+
+    def t2(self, index):
+        return self.qubit(index).t2
+
+    def median_two_qubit_duration(self):
+        durations = [e.duration for e in self.edges if e.duration]
+        if not durations:
+            return 0.0
+        durations.sort()
+        n = len(durations)
+        if n % 2:
+            return durations[n // 2]
+        return 0.5 * (durations[n // 2 - 1] + durations[n // 2])
+
+    def age(self, now=None):
+        now = now or _dt.datetime.now(_dt.timezone.utc)
+        captured = self.captured_at
+        if captured.tzinfo is None:
+            captured = captured.replace(tzinfo=_dt.timezone.utc)
+        return now - captured
+
+    def age_hours(self, now=None):
+        return self.age(now).total_seconds() / 3600.0
+
+    def missing_fields(self):
+        """list of holes in the calibration, for the report header"""
+        problems = []
+        for q in self.qubits:
+            for name in ("t1", "t2", "readout_error", "sx_error"):
+                if getattr(q, name) is None:
+                    problems.append(f"qubit[{q.index}].{name}")
+        for e in self.edges:
+            if e.error is None:
+                problems.append(f"edge[{e.control}->{e.target}].error")
+            if e.duration is None:
+                problems.append(f"edge[{e.control}->{e.target}].duration")
+        return problems
+
+
+def clamp_snapshot_t2(qubits):
+    """apply T2 <= 2*T1 to a freshly loaded qubit list"""
+    out = []
+    for q in qubits:
+        t2 = clamp_t2(q.t1, q.t2)
+        out.append(q if t2 == q.t2 else q.model_copy(update={"t2": t2}))
+    return out
+
+
+# ---------------- cache paths ----------------
+
+
+def cache_dir():
     override = os.environ.get("Q_AUDIT_CACHE_DIR")
     path = Path(override) if override else Path(user_cache_dir("q-audit", "q-audit"))
     path.mkdir(parents=True, exist_ok=True)
     return path
 
 
-def cache_path(backend_name: str) -> Path:
+def cache_path(backend_name):
     safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in backend_name)
     return cache_dir() / f"calibration-{safe}.json"
 
 
-# --------------------------------------------------------------------------
-# Target -> snapshot
-# --------------------------------------------------------------------------
+# ---------------- Target -> snapshot ----------------
 
 
-def _two_qubit_op_names(target: Any) -> list[str]:
-    names: list[str] = []
+def _two_qubit_op_names(target):
+    names = []
     for name in target.operation_names:
         try:
             props = target[name]
@@ -61,7 +217,9 @@ def _two_qubit_op_names(target: Any) -> list[str]:
     return names
 
 
-def _one_qubit_error(target: Any, qubit: int) -> float | None:
+def _one_qubit_error(target, qubit):
+    # T1 and T2 come from qubit_properties but the gate errors are stored
+    # seperately per operation, so this has to go looking
     for name in _ONE_QUBIT_ERROR_PREFERENCE:
         if name not in target.operation_names:
             continue
@@ -74,29 +232,25 @@ def _one_qubit_error(target: Any, qubit: int) -> float | None:
     return None
 
 
-def _readout_error(target: Any, qubit: int) -> float | None:
+def _readout_error(target, qubit):
     if "measure" not in target.operation_names:
         return None
     try:
         props = target["measure"].get((qubit,))
     except (KeyError, TypeError):
         return None
-    return None if props is None or props.error is None else float(props.error)
+    if props is None or props.error is None:
+        return None
+    return float(props.error)
 
 
-def snapshot_from_target(
-    target: Any,
-    *,
-    backend_name: str,
-    source: str,
-    captured_at: _dt.datetime | None = None,
-) -> CalibrationSnapshot:
-    """Convert a Qiskit ``Target`` into a plain, serialisable snapshot."""
+def snapshot_from_target(target, *, backend_name, source, captured_at=None):
+    """pull a qiskit Target apart into a snapshot of plain numbers"""
     captured_at = captured_at or _dt.datetime.now(_dt.timezone.utc)
     num_qubits = target.num_qubits
     qprops = target.qubit_properties or []
 
-    qubits: list[QubitCal] = []
+    qubits = []
     for i in range(num_qubits):
         qp = qprops[i] if i < len(qprops) else None
         qubits.append(
@@ -109,11 +263,11 @@ def snapshot_from_target(
                 frequency=None if qp is None else _as_float(getattr(qp, "frequency", None)),
             )
         )
-    # Enforce T2 <= 2*T1 at the ingest boundary so nothing downstream has to.
+    # clamp here so nothing downstream has to think about it
     qubits = clamp_snapshot_t2(qubits)
 
-    edges: list[EdgeCal] = []
-    seen: set[tuple[int, int, str]] = set()
+    edges = []
+    seen = set()
     for name in _two_qubit_op_names(target):
         for qargs, props in target[name].items():
             if qargs is None or len(qargs) != 2:
@@ -132,17 +286,17 @@ def snapshot_from_target(
                 )
             )
 
-    coupling: list[tuple[int, int]] = []
+    coupling = []
     cmap = target.build_coupling_map()
     if cmap is not None:
-        undirected: set[tuple[int, int]] = set()
+        undirected = set()
         for a, b in cmap.get_edges():
             undirected.add((min(a, b), max(a, b)))
         coupling = sorted(undirected)
 
     return CalibrationSnapshot(
         backend_name=backend_name,
-        source=source,  # type: ignore[arg-type]
+        source=source,
         captured_at=captured_at,
         num_qubits=num_qubits,
         dt=_as_float(getattr(target, "dt", None)),
@@ -153,23 +307,21 @@ def snapshot_from_target(
     )
 
 
-def _as_float(v: Any) -> float | None:
+def _as_float(v):
     if v is None:
         return None
     try:
         f = float(v)
     except (TypeError, ValueError):
         return None
-    return None if f != f else f  # drop NaN
+    return None if f != f else f  # f != f catches NaN
 
 
-# --------------------------------------------------------------------------
-# Sources
-# --------------------------------------------------------------------------
+# ---------------- where snapshots come from ----------------
 
 
-def _fake_backend_class(name: str):
-    """Map ``fake_sherbrooke`` -> ``FakeSherbrooke`` in the runtime fake provider."""
+def _fake_backend_class(name):
+    """fake_sherbrooke -> FakeSherbrooke"""
     from qiskit_ibm_runtime import fake_provider
 
     normalised = name.strip().lower().replace("-", "_")
@@ -185,16 +337,16 @@ def _fake_backend_class(name: str):
         "fake_" + a[4:].lower() for a in dir(fake_provider) if a.startswith("Fake")
     )
     raise CalibrationError(
-        f"Unknown fake backend {name!r}.",
-        hint="Try one of: " + ", ".join(available[:12]) + ", ...",
+        f"couldn't find a fake backend called {name!r}",
+        hint="try one of: " + ", ".join(available[:12]) + ", ...",
     )
 
 
-def load_fake_backend(name: str) -> tuple[CalibrationSnapshot, Any]:
-    """Load an offline reference snapshot and the backend object it came from.
+def load_fake_backend(name):
+    """offline snapshot plus the backend object it came from.
 
-    The backend object is returned because the transpiler needs a real
-    ``Target``; the snapshot is what every *numeric* decision is made from.
+    we hand back the backend too because the transpiler needs a real Target,
+    but every number we actually use comes from the snapshot
     """
     cls = _fake_backend_class(name)
     backend = cls()
@@ -204,7 +356,7 @@ def load_fake_backend(name: str) -> tuple[CalibrationSnapshot, Any]:
         raw = getattr(props, "last_update_date", None)
         if raw is not None:
             captured = raw if isinstance(raw, _dt.datetime) else None
-    except Exception:  # noqa: BLE001 - properties() is best-effort metadata
+    except Exception:  # properties() is just metadata, don't die over it
         captured = None
     if captured is not None and captured.tzinfo is None:
         captured = captured.replace(tzinfo=_dt.timezone.utc)
@@ -217,7 +369,7 @@ def load_fake_backend(name: str) -> tuple[CalibrationSnapshot, Any]:
     return snap, backend
 
 
-def load_from_cache(backend_name: str, *, ttl_seconds: int = CACHE_TTL_SECONDS) -> CalibrationSnapshot | None:
+def load_from_cache(backend_name, *, ttl_seconds=CACHE_TTL_SECONDS):
     path = cache_path(backend_name)
     if not path.exists():
         return None
@@ -227,58 +379,46 @@ def load_from_cache(backend_name: str, *, ttl_seconds: int = CACHE_TTL_SECONDS) 
         return None
     try:
         snap = CalibrationSnapshot.model_validate(raw)
-    except Exception:  # noqa: BLE001 - a stale schema is a cache miss, not a crash
+    except Exception:  # old schema in the cache is a miss, not a crash
         return None
     if snap.age().total_seconds() > ttl_seconds:
         return None
     return snap.model_copy(update={"source": "cache"})
 
 
-def save_to_cache(snapshot: CalibrationSnapshot) -> Path:
+def save_to_cache(snapshot):
     path = cache_path(snapshot.backend_name)
+    # write to a temp file first so a crash mid write can't leave junk
     tmp = path.with_suffix(".json.tmp")
     tmp.write_text(snapshot.model_dump_json(indent=2))
     tmp.replace(path)
     return path
 
 
-def load_live(backend_name: str) -> tuple[CalibrationSnapshot, Any]:
-    """Fetch calibration from IBM Quantum. Requires saved credentials."""
+def load_live(backend_name):
+    """get calibration from ibm. needs saved credentials"""
     try:
         from qiskit_ibm_runtime import QiskitRuntimeService
-    except ImportError as exc:  # pragma: no cover - dependency is pinned
-        raise CalibrationError("qiskit-ibm-runtime is not installed.") from exc
+    except ImportError as exc:
+        raise CalibrationError("qiskit-ibm-runtime isn't installed") from exc
     try:
         service = QiskitRuntimeService()
         backend = service.backend(backend_name)
-    except Exception as exc:  # noqa: BLE001 - network/auth failures are all the same to us
+    except Exception as exc:  # network, auth, whatever, same story
         raise CalibrationError(
-            f"Could not reach IBM Quantum for backend {backend_name!r}: {exc}",
-            hint="Run with --backend fake_sherbrooke to work offline, or save "
-            "credentials with QiskitRuntimeService.save_account(...).",
+            f"couldn't reach IBM Quantum for {backend_name!r}: {exc}",
+            hint="use --backend fake_sherbrooke to work offline, or save "
+            "credentials with QiskitRuntimeService.save_account(...)",
         ) from exc
     snap = snapshot_from_target(backend.target, backend_name=backend_name, source="live")
     return snap, backend
 
 
-# --------------------------------------------------------------------------
-# Resolution
-# --------------------------------------------------------------------------
+def resolve_calibration(backend_name, *, use_cache=True, refresh=False):
+    """work out which snapshot to use and get a backend to transpile against.
 
-
-def resolve_calibration(
-    backend_name: str,
-    *,
-    use_cache: bool = True,
-    refresh: bool = False,
-) -> tuple[CalibrationSnapshot, Any]:
-    """Resolve a calibration snapshot plus a Qiskit backend to transpile against.
-
-    Returns ``(snapshot, backend)``.  ``backend`` may be ``None`` only if a
-    cached snapshot were usable without one, which never happens today: the
-    transpiler always needs a ``Target``, so a cache hit still instantiates the
-    backend.  We keep the snapshot as the source of truth for every number and
-    use the backend purely for its coupling graph and gate set.
+    returns (snapshot, backend). even on a cache hit we still build the backend
+    since the transpiler needs a Target, we just don't take its numbers
     """
     if backend_name.lower().startswith("fake"):
         return load_fake_backend(backend_name)
@@ -297,39 +437,30 @@ def resolve_calibration(
     return snap, backend
 
 
-def check_staleness(
-    snapshot: CalibrationSnapshot,
-    *,
-    allow_stale: bool,
-    limit_hours: float = STALE_LIMIT_HOURS,
-) -> list[str]:
-    """Enforce the freshness policy. Returns warnings; raises when it must.
+def check_staleness(snapshot, *, allow_stale, limit_hours=STALE_LIMIT_HOURS):
+    """freshness policy. gives back warnings, raises if the data is too old.
 
-    Live and cached snapshots older than ``limit_hours`` are refused unless
-    ``--allow-stale`` is passed -- recommending a layout from day-old T1/T2 is
-    worse than recommending nothing.
-
-    Offline *reference* snapshots (fake backends) are never refused: being
-    frozen is the point of them.  They always carry a loud warning instead.
+    recommending a layout off day old T1/T2 is worse than recommending nothing.
+    fake backends are exempt, being frozen is the whole point of them
     """
     age_h = snapshot.age_hours()
-    warnings: list[str] = []
+    warnings = []
     if snapshot.source == "fake_backend":
         warnings.append(
-            f"Offline reference snapshot: {snapshot.backend_name} calibration is dated "
-            f"{snapshot.captured_at.date()} ({age_h / 24.0:.0f} days old). Results "
+            f"offline reference snapshot: {snapshot.backend_name} calibration is from "
+            f"{snapshot.captured_at.date()} ({age_h / 24.0:.0f} days ago). these numbers "
             f"describe that frozen calibration, not today's hardware."
         )
         return warnings
     if age_h > limit_hours:
         if not allow_stale:
             raise StaleCalibrationError(
-                f"Calibration for {snapshot.backend_name} is {age_h:.1f}h old "
-                f"(limit {limit_hours:.0f}h); refusing to make a recommendation.",
-                hint="Re-run with --allow-stale to proceed anyway, or --refresh to refetch.",
+                f"calibration for {snapshot.backend_name} is {age_h:.1f}h old "
+                f"(limit is {limit_hours:.0f}h), not going to recommend a layout off that",
+                hint="re-run with --allow-stale if you really want it, or --refresh to refetch",
             )
         warnings.append(
             f"STALE CALIBRATION ACCEPTED: {age_h:.1f}h old (limit {limit_hours:.0f}h). "
-            "Layout recommendations may be wrong."
+            "the layout recommendation might be wrong."
         )
     return warnings

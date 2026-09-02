@@ -1,11 +1,12 @@
 #!/bin/sh
-# Dev launcher.
+# launcher, use this instead of the installed entry point.
 #
-# This repo lives under ~/Desktop, where macOS keeps re-applying the UF_HIDDEN
-# file flag to everything inside .venv -- and CPython's site.addpackage()
-# silently skips *hidden* .pth files. That makes `uv pip install -e .` inert:
-# the editable path never reaches sys.path. Running from src/ sidesteps it
-# entirely. See README "Known environment gotcha".
+# this repo lives under ~/Desktop where macos keeps setting the UF_HIDDEN flag
+# on everything inside .venv, and python's site.addpackage() silently skips
+# hidden .pth files. so `uv pip install -e .` does nothing, the editable path
+# never makes it onto sys.path and importing q_audit just fails with no
+# explanation. running out of src/ avoids the whole thing. took me an
+# embarrassingly long time to work that out, see the README.
 here=$(cd "$(dirname "$0")" && pwd)
 PYTHONPATH="$here/src${PYTHONPATH:+:$PYTHONPATH}" \
 PYTHONWARNINGS="${PYTHONWARNINGS:-ignore}" \

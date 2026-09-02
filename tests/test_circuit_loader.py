@@ -1,6 +1,4 @@
-"""Circuit ingestion: .py, OpenQASM 2/3, stdin, and the failure modes."""
-
-from __future__ import annotations
+"""loading circuits: .py, qasm 2 and 3, stdin, and all the ways it goes wrong"""
 
 import io
 import sys

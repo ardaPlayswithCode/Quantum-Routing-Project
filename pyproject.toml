@@ -1,12 +1,12 @@
 [project]
 name = "quantum-transpile-audit"
 version = "0.1.0"
-description = "q-audit: side-by-side audit of Qiskit's default transpilation against a T1/T2-aware layout injection."
+description = "q-audit: compare qiskit's default transpilation against a T1/T2-aware layout"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    # Pinned EXACTLY. The VF2 `vf2_avg_error_map` property-set hook is a private
-    # contract; see tests/test_injection_contract.py (canary).
+    # pinned exactly. the vf2_avg_error_map property set key isn't public api,
+    # see tests/test_injection_contract.py
     "qiskit==2.5.1",
     "qiskit-ibm-runtime==0.48.0",
     "typer>=0.27.1",
@@ -19,17 +19,12 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Aer is DEV-ONLY. It is imported lazily inside `--verify` and the benchmark
-# harness and must never be imported on the optimizer hot path.
+# aer is dev only, it's imported lazily inside --verify and the benchmarks and
+# never on the normal path
 dev = [
     "qiskit-aer==0.17.2",
     "pytest>=8.0",
     "pytest-timeout>=2.4.0",
-]
-# Pre-existing agent/RAG stack, kept out of the MVP runtime path.
-agent = [
-    "chromadb>=1.5.9",
-    "pydantic-ai>=2.27.0",
 ]
 
 [project.scripts]
@@ -40,7 +35,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/q_audit", "src/quantum_transpile_audit"]
+packages = ["src/q_audit"]
 
 [tool.uv.extra-build-dependencies]
 ibm-platform-services = ["setuptools", "pkg_resources"]
@@ -50,5 +45,5 @@ testpaths = ["tests"]
 addopts = "-q --timeout=900"
 markers = [
     "slow: end-to-end transpile/simulation tests (deselect with -m 'not slow')",
-    "aer: requires qiskit-aer",
+    "aer: needs qiskit-aer",
 ]

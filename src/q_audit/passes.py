@@ -1,125 +1,112 @@
-"""The one place q-audit reaches into Qiskit's transpiler internals.
+"""the one place we poke at qiskit's transpiler internals.
 
-Why an ErrorMap and not a custom SABRE
---------------------------------------
-SABRE's cost heuristic lives in Rust and takes no Python hook: there is no
-supported way to make its swap selection noise-aware from Python.  VF2Layout
-and VF2PostLayout, by contrast, read an optional ``vf2_avg_error_map`` out of
-the property set and score candidate embeddings with it.  So the leverage point
-is *layout*, not routing: we bias which physical qubits the circuit lands on,
-then let stock SABRE route between them.
+short version of why it works this way: sabre's swap heuristic is written in
+rust and there's no python hook into it, so you can't make routing noise aware.
+but VF2Layout and VF2PostLayout both look for an optional error map in the
+property set under "vf2_avg_error_map" and score candidate layouts with it. so
+we put our own map there. that means we pick better *qubits* and then let stock
+sabre do the routing between them.
 
-That hook is a private-ish contract.  ``tests/test_injection_contract.py`` is a
-canary that fails loudly if a Qiskit upgrade changes it.
+this key isn't really public api, which is why tests/test_injection_contract.py
+exists. if a qiskit upgrade changes it the audit doesn't crash, it just quietly
+does nothing, which is worse
 """
 
-from __future__ import annotations
-
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from qiskit.transpiler.basepasses import AnalysisPass
 from qiskit.transpiler.passes.layout.vf2_utils import ErrorMap
 
-from .feature_extract import DagOpStats
-from .models import CalibrationSnapshot
 from .physics import idle_infidelity
 
 VF2_ERROR_MAP_KEY = "vf2_avg_error_map"
 
 
-# eq=False -> identity hash. Frozen dataclasses derive __hash__ from their
-# fields, and these fields are dicts; a pass constructor argument must hash.
+# eq=False so it hashes by identity. frozen dataclasses build __hash__ out of
+# their fields and these fields are dicts, and pass arguments have to hash
 @dataclass(frozen=True, eq=False)
 class ErrorMapBuild:
-    """The injected map plus the raw numbers behind it, for reporting."""
+    """the map we inject plus the raw numbers behind it so we can report them"""
 
     error_map: ErrorMap
-    diagonal: dict[int, float]
-    static: dict[int, float]
-    idle_penalty: dict[int, float]
+    diagonal: dict
+    static: dict
+    idle_penalty: dict
     t_est_s: float
     alpha: float
-    scaling: str = "normalized"
-    exponents: dict[str, float] = field(default_factory=dict)
+    scaling: str
+    exponents: dict
 
-    def to_dict(self) -> dict:
+    def to_dict(self):
+        if self.diagonal:
+            median = sorted(self.diagonal.values())[len(self.diagonal) // 2]
+        else:
+            median = None
         return {
             "t_est_s": self.t_est_s,
             "alpha": self.alpha,
             "scaling": self.scaling,
             "exponents": self.exponents,
-            "diagonal_median": (
-                sorted(self.diagonal.values())[len(self.diagonal) // 2]
-                if self.diagonal
-                else None
-            ),
-            "worst_qubits": [
-                {"qubit": q, "penalty": v} for q, v in self.worst_qubits(5)
-            ],
-            "best_qubits": [
-                {"qubit": q, "penalty": v} for q, v in self.best_qubits(5)
-            ],
+            "diagonal_median": median,
+            "worst_qubits": [{"qubit": q, "penalty": v} for q, v in self.worst_qubits(5)],
+            "best_qubits": [{"qubit": q, "penalty": v} for q, v in self.best_qubits(5)],
         }
 
-    def worst_qubits(self, n: int = 5) -> list[tuple[int, float]]:
+    def worst_qubits(self, n=5):
         return sorted(self.diagonal.items(), key=lambda kv: kv[1], reverse=True)[:n]
 
-    def best_qubits(self, n: int = 5) -> list[tuple[int, float]]:
+    def best_qubits(self, n=5):
         return sorted(self.diagonal.items(), key=lambda kv: kv[1])[:n]
 
 
 def build_decoherence_error_map(
-    snapshot: CalibrationSnapshot,
+    snapshot,
     *,
-    t_est_s: float,
-    alpha: float = 1.0,
-    op_stats: DagOpStats | None = None,
-    scaling: str = "normalized",
-) -> ErrorMapBuild:
-    """Build a VF2 ``ErrorMap`` whose diagonal carries a T1/T2 idle penalty.
+    t_est_s,
+    alpha=1.0,
+    op_stats=None,
+    scaling="normalized",
+):
+    """build the error map. diagonal = per qubit, off diagonal = per coupler.
 
-    Off-diagonal (per coupler) is the calibrated 2q gate error, passed through
-    **unchanged**.  A reported 2q error already includes the decoherence that
-    happens during the gate; adding a relaxation term on top would double count
-    and would systematically over-punish the slow (but often high-fidelity)
-    couplers.
+    the off diagonal is just the calibrated 2q error, untouched. a 2q error
+    already has the decoherence during the gate baked in, adding relaxation on
+    top would double count it and would punish the slow couplers, which are
+    often the good ones.
 
-    Diagonal, ``scaling="raw"`` -- the literal formula from the design doc::
+    the diagonal is where the T1/T2 goes. with scaling="raw" it's literally
 
-        d[q] = sx_error[q] + readout_error[q] + alpha * eps_idle(t_est, T1, T2)
+        d[q] = sx + readout + alpha * eps_idle(t_est, T1, T2)
 
-    Diagonal, ``scaling="normalized"`` (default) -- the same physics, corrected
-    for how VF2 actually consumes the number.  VF2 scores a candidate embedding
-    as ``prod_q (1 - d[q]) ** n1q(q)``, so ``d[q]`` is a *per-1q-operation*
-    rate.  Readout happens once per qubit and the idle penalty is already a
-    whole-circuit total, so both must be spread across the exponent::
+    with scaling="normalized" (the default) it's the same physics but divided
+    out by how vf2 actually uses the number. vf2 scores a layout as
+    prod_q (1 - d[q]) ** n1q(q), so d[q] is a *per 1q op* rate, not a per qubit
+    total. readout happens once and the idle penalty is already a whole circuit
+    number, so both have to be spread over the exponent:
 
-        d[q] = 1 - exp( ( g_bar*ln(1-sx) + m_bar*ln(1-ro)
-                          + ln(1 - alpha*eps_idle) ) / n_bar )
+        d[q] = 1 - exp((g_bar*ln(1-sx) + m_bar*ln(1-ro)
+                        + ln(1 - alpha*eps_idle)) / n_bar)
 
-    with ``n_bar`` the mean 1q-op count per active qubit, ``g_bar`` the mean
-    error-bearing 1q-gate count and ``m_bar`` the mean measurement count.  This
-    makes the VF2 score a faithful proxy for ESP instead of one that scales the
-    readout and idle terms by an arbitrary gate count.
+    took me a while to figure out that this is what was wrong with the raw
+    version. normalized is worth about double in the benchmarks
     """
     if alpha < 0:
         raise ValueError("alpha must be non-negative")
     if scaling not in ("raw", "normalized"):
-        raise ValueError(f"unknown scaling {scaling!r}; use 'raw' or 'normalized'")
+        raise ValueError(f"unknown scaling {scaling!r}, use 'raw' or 'normalized'")
 
     n_bar = op_stats.n_bar if op_stats else 0.0
     g_bar = op_stats.g_bar if op_stats else 0.0
     m_bar = op_stats.m_bar if op_stats else 0.0
-    effective_scaling = scaling
+    eff_scaling = scaling
     if scaling == "normalized" and n_bar <= 0.0:
-        # Nothing to spread the one-shot terms over; the raw formula is the
-        # only sensible thing left.
-        effective_scaling = "raw"
+        # nothing to divide by, fall back to raw
+        eff_scaling = "raw"
 
-    diagonal: dict[int, float] = {}
-    static: dict[int, float] = {}
-    idle_pen: dict[int, float] = {}
+    diagonal = {}
+    static = {}
+    idle_pen = {}
 
     for cal in snapshot.qubits:
         sx = min(0.999999, max(0.0, cal.sx_error or 0.0))
@@ -128,7 +115,7 @@ def build_decoherence_error_map(
         static[cal.index] = sx + ro
         idle_pen[cal.index] = idle
 
-        if effective_scaling == "raw":
+        if eff_scaling == "raw":
             value = sx + ro + alpha * idle
         else:
             weighted_idle = min(0.999999, max(0.0, alpha * idle))
@@ -138,8 +125,8 @@ def build_decoherence_error_map(
                 + math.log1p(-weighted_idle)
             )
             value = 1.0 - math.exp(log_fid / n_bar)
-        # Clip into [0, 1]: VF2 scores in probability space, an error > 1 makes
-        # the score meaningless rather than merely bad.
+        # vf2 scores in probability space so an error above 1 makes the score
+        # meaningless rather than just bad
         diagonal[cal.index] = min(1.0, max(0.0, value))
 
     n_entries = len(diagonal) + 2 * len(snapshot.edges)
@@ -147,8 +134,11 @@ def build_decoherence_error_map(
     for q, err in diagonal.items():
         error_map.add_error((q, q), float(err))
     for edge in snapshot.edges:
-        err = 1.0 if edge.error is None else min(1.0, max(0.0, float(edge.error)))
-        # Both orientations: the interaction graph VF2 scores is undirected.
+        if edge.error is None:
+            err = 1.0
+        else:
+            err = min(1.0, max(0.0, float(edge.error)))
+        # both orientations, the graph vf2 scores is undirected
         error_map.add_error((edge.control, edge.target), err)
         error_map.add_error((edge.target, edge.control), err)
 
@@ -159,29 +149,21 @@ def build_decoherence_error_map(
         idle_penalty=idle_pen,
         t_est_s=t_est_s,
         alpha=alpha,
-        scaling=effective_scaling,
+        scaling=eff_scaling,
         exponents={"n_bar": n_bar, "g_bar": g_bar, "m_bar": m_bar},
     )
 
 
 class InjectDecoherenceErrorMap(AnalysisPass):
-    """Put a T1/T2-aware ``ErrorMap`` where VF2Layout/VF2PostLayout will find it.
+    """drops our error map into the property set where vf2 will find it.
 
-    Analysis-only: it never touches the DAG.  It must run *before* VF2Layout in
-    the same pass manager (the property set is shared across stages of a
-    ``StagedPassManager``, so one injection covers both VF2 passes).
+    analysis only, never touches the dag. has to run before VF2Layout in the
+    same pass manager. the property set is shared across stages of a
+    StagedPassManager so injecting once covers both vf2 passes
     """
 
-    def __init__(
-        self,
-        snapshot: CalibrationSnapshot,
-        *,
-        t_est_s: float,
-        alpha: float = 1.0,
-        op_stats: DagOpStats | None = None,
-        scaling: str = "normalized",
-        build: ErrorMapBuild | None = None,
-    ) -> None:
+    def __init__(self, snapshot, *, t_est_s, alpha=1.0, op_stats=None,
+                 scaling="normalized", build=None):
         super().__init__()
         self.snapshot = snapshot
         self.t_est_s = t_est_s
@@ -194,25 +176,25 @@ class InjectDecoherenceErrorMap(AnalysisPass):
             scaling=scaling,
         )
 
-    def run(self, dag):  # noqa: D102 - AnalysisPass contract
+    def run(self, dag):
         self.property_set[VF2_ERROR_MAP_KEY] = self.build.error_map
         self.property_set["q_audit_error_map_build"] = self.build
         return dag
 
 
-def error_map_is_supported() -> bool:
-    """Cheap runtime check that the injection contract still holds.
+def error_map_is_supported():
+    """quick check that the hook is still there, so the cli can say so.
 
-    Verifies (a) ``ErrorMap`` still exposes ``add_error``/``get`` and (b) both
-    VF2 passes still read the property-set key.  Used by the CLI to fail with a
-    clear message instead of silently producing a no-op audit.
+    checks ErrorMap still has add_error/get and that both vf2 passes still
+    mention the property set key. grepping the source is gross but it's the
+    only way to tell without actually running a transpile
     """
     try:
         em = ErrorMap(1)
         em.add_error((0, 0), 0.1)
         if em.get((0, 0)) is None:
             return False
-    except Exception:  # noqa: BLE001
+    except Exception:
         return False
 
     import inspect

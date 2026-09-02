@@ -1,5 +1,4 @@
-"""``python -m q_audit`` entry point."""
-
+# lets you run `python -m q_audit`
 from .cli import main
 
 main()

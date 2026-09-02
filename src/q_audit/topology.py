@@ -1,58 +1,54 @@
-"""ASCII rendering of a device coupling graph.
+"""ascii picture of the device coupling graph.
 
-Coordinates are *derived* from the coupling map, not hard-coded for Eagle: IBM
-numbers qubits sequentially along each row, so the edges with consecutive
-indices form the horizontal chains and everything else is a vertical connector.
-BFS over the chain graph then pins each chain to a row and an x-offset.  This
-works for heavy-hex (Eagle/Heron) and for the older lattice devices; anything it
-cannot lay out falls back to a plain listing rather than drawing a lie.
+the coordinates aren't hard coded for eagle, they get worked out from the
+coupling map. ibm numbers qubits along each row, so edges between consecutive
+indices are the horizontal chains and everything else is a vertical connector.
+then bfs over the chains to pin each one to a row and an x offset. works for
+heavy hex and the older lattice devices. if it can't lay something out it
+prints a plain list instead of drawing a lie
 """
-
-from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .models import CalibrationSnapshot
 from .physics import percentile
 
-# Rendered cell is a 3-character right-aligned index plus a 1-character
-# membership marker, then a 1-character link to the next column.
+# each cell is a 3 char right aligned index plus a 1 char membership marker
 _CELL = 3
 _MARK = {"both": "*", "audited": "a", "baseline": "b", "none": " "}
 
 
 @dataclass(frozen=True)
 class Grid:
-    coords: dict[int, tuple[int, int]]  # qubit -> (row, col)
+    coords: dict  # qubit -> (row, col)
     ok: bool
     reason: str = ""
 
     @property
-    def n_rows(self) -> int:
+    def n_rows(self):
         return 1 + max((r for r, _ in self.coords.values()), default=0)
 
     @property
-    def n_cols(self) -> int:
+    def n_cols(self):
         return 1 + max((c for _, c in self.coords.values()), default=0)
 
 
-def _chains(coupling: list[tuple[int, int]]) -> tuple[dict[int, int], dict[int, int], dict[int, list[int]]]:
-    """Group qubits into horizontal chains of consecutive indices."""
-    adj: dict[int, set[int]] = {}
+def _chains(coupling):
+    """group qubits into horizontal chains of consecutive indices"""
+    adj = {}
     for a, b in coupling:
         if abs(a - b) == 1:
             adj.setdefault(a, set()).add(b)
             adj.setdefault(b, set()).add(a)
 
     nodes = sorted({q for edge in coupling for q in edge})
-    chain_of: dict[int, int] = {}
-    members: dict[int, list[int]] = {}
+    chain_of = {}
+    members = {}
     next_id = 0
     for node in nodes:
         if node in chain_of:
             continue
         stack = [node]
-        group: list[int] = []
+        group = []
         chain_of[node] = next_id
         while stack:
             cur = stack.pop()
@@ -68,8 +64,8 @@ def _chains(coupling: list[tuple[int, int]]) -> tuple[dict[int, int], dict[int, 
     return chain_of, pos_in_chain, members
 
 
-def build_grid(snapshot: CalibrationSnapshot) -> Grid:
-    coupling = [tuple(e) for e in snapshot.coupling]  # type: ignore[misc]
+def build_grid(snapshot):
+    coupling = [tuple(e) for e in snapshot.coupling]
     if not coupling:
         return Grid({}, ok=False, reason="no coupling map")
 
@@ -77,18 +73,19 @@ def build_grid(snapshot: CalibrationSnapshot) -> Grid:
     if not members:
         return Grid({}, ok=False, reason="no chains found")
 
-    # Chain adjacency via the non-consecutive ("vertical") edges.
-    links: dict[int, list[tuple[int, int]]] = {}
+    # chains connect to each other through the non consecutive edges
+    links = {}
     for a, b in coupling:
-        ca, cb = chain_of.get(a), chain_of.get(b)
+        ca = chain_of.get(a)
+        cb = chain_of.get(b)
         if ca is None or cb is None or ca == cb:
             continue
         links.setdefault(ca, []).append((a, b))
         links.setdefault(cb, []).append((b, a))
 
     start = min(members, key=lambda c: min(members[c]))
-    row_of: dict[int, int] = {start: 0}
-    offset_of: dict[int, int] = {start: 0}
+    row_of = {start: 0}
+    offset_of = {start: 0}
     queue = [start]
     while queue:
         chain = queue.pop(0)
@@ -98,19 +95,18 @@ def build_grid(snapshot: CalibrationSnapshot) -> Grid:
                 continue
             direction = 1 if min(members[other]) > min(members[chain]) else -1
             row_of[other] = row_of[chain] + direction
-            offset_of[other] = (
-                offset_of[chain] + pos_in_chain[here] - pos_in_chain[there]
-            )
+            offset_of[other] = offset_of[chain] + pos_in_chain[here] - pos_in_chain[there]
             queue.append(other)
 
     if len(row_of) != len(members):
         return Grid({}, ok=False, reason="coupling graph is not a single component")
 
-    raw: dict[int, tuple[int, int]] = {}
+    raw = {}
     for chain, group in members.items():
         for q in group:
             raw[q] = (row_of[chain], offset_of[chain] + pos_in_chain[q])
 
+    # shift everything so the top left is (0, 0)
     min_row = min(r for r, _ in raw.values())
     min_col = min(c for _, c in raw.values())
     coords = {q: (r - min_row, c - min_col) for q, (r, c) in raw.items()}
@@ -121,15 +117,15 @@ def build_grid(snapshot: CalibrationSnapshot) -> Grid:
     return Grid(coords, ok=True)
 
 
-def t2_tiers(snapshot: CalibrationSnapshot) -> tuple[float, float]:
-    """33rd/66th percentile T2 cutoffs used for the red/yellow/green colouring."""
+def t2_tiers(snapshot):
+    """33rd/66th percentile T2, used for the red/yellow/green colours"""
     values = [q.t2 for q in snapshot.qubits if q.t2 is not None]
     if not values:
         return (0.0, 0.0)
     return (percentile(values, 33.3), percentile(values, 66.6))
 
 
-def tier_of(t2: float | None, cuts: tuple[float, float]) -> str:
+def tier_of(t2, cuts):
     if t2 is None:
         return "unknown"
     if t2 <= cuts[0]:
@@ -147,18 +143,10 @@ _STYLE = {
 }
 
 
-def render_topology(
-    snapshot: CalibrationSnapshot,
-    *,
-    baseline_layout: list[int],
-    audited_layout: list[int],
-    markup: bool = True,
-) -> list[str]:
-    """Render the device as ASCII, coloured by T2 tier, with both layouts marked.
+def render_topology(snapshot, *, baseline_layout, audited_layout, markup=True):
+    """draw the device, coloured by T2 tier, with both layouts marked.
 
-    Returns a list of lines.  With ``markup=True`` the lines carry rich markup
-    tags; with ``markup=False`` they are plain text (used for ``--no-color`` and
-    for tests).
+    markup=False gives plain lines, for tests and for piping
     """
     grid = build_grid(snapshot)
     cuts = t2_tiers(snapshot)
@@ -177,24 +165,20 @@ def render_topology(
     horizontal = {
         (min(a, b), max(a, b))
         for a, b in snapshot.coupling
-        if a in grid.coords
-        and b in grid.coords
-        and grid.coords[a][0] == grid.coords[b][0]
+        if a in grid.coords and b in grid.coords and grid.coords[a][0] == grid.coords[b][0]
     }
     vertical = {
         (min(a, b), max(a, b))
         for a, b in snapshot.coupling
-        if a in grid.coords
-        and b in grid.coords
-        and grid.coords[a][0] != grid.coords[b][0]
+        if a in grid.coords and b in grid.coords and grid.coords[a][0] != grid.coords[b][0]
     }
-    vertical_cols: dict[int, set[int]] = {}
+    vertical_cols = {}
     for a, b in vertical:
         (ra, ca), (rb, _) = grid.coords[a], grid.coords[b]
         top = min(ra, rb)
         vertical_cols.setdefault(top, set()).add(ca)
 
-    def cell(q: int) -> str:
+    def cell(q):
         if q in base and q in audit:
             member = "both"
         elif q in audit:
@@ -203,9 +187,8 @@ def render_topology(
             member = "baseline"
         else:
             member = "none"
-        # The marker is ASCII on purpose: colour is stripped the moment the
-        # output is piped, and a report that loses its meaning under `| less`
-        # is not a report.
+        # the marker is ascii on purpose, colour disappears the second you pipe
+        # this anywhere and a map that means nothing under `| less` is useless
         text = f"{q:>{_CELL}d}{_MARK[member]}"
         if not markup:
             return text
@@ -218,9 +201,9 @@ def render_topology(
             style = f"bold {style} on grey19"
         return f"[{style}]{text}[/]"
 
-    lines: list[str] = []
+    lines = []
     for r in range(n_rows):
-        row_chars: list[str] = []
+        row_chars = []
         for c in range(n_cols):
             q = by_cell.get((r, c))
             row_chars.append(cell(q) if q is not None else " " * (_CELL + 1))
@@ -236,7 +219,7 @@ def render_topology(
         if line.strip():
             lines.append(line)
         if r in vertical_cols and r < n_rows - 1:
-            conn: list[str] = []
+            conn = []
             for c in range(n_cols):
                 conn.append("  │ " if c in vertical_cols[r] else " " * (_CELL + 1))
                 if c < n_cols - 1:
@@ -245,7 +228,7 @@ def render_topology(
     return lines
 
 
-def legend_lines(snapshot: CalibrationSnapshot, *, markup: bool = True) -> list[str]:
+def legend_lines(snapshot, *, markup=True):
     lo, hi = t2_tiers(snapshot)
     marks = "markers:  b = baseline only   a = audited only   * = both"
     if markup:

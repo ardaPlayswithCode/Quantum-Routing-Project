@@ -1,10 +1,8 @@
-"""Validate the analytic idle-infidelity formula against Aer's own channel.
+"""check our idle formula against aer's own thermal relaxation channel.
 
-If these ever disagree, either our formula drifted or Aer changed its
-thermal-relaxation model -- both are things we want to hear about loudly.
+if these ever disagree then either i broke the formula or aer changed their
+model, and i want to know about it either way
 """
-
-from __future__ import annotations
 
 import pytest
 
@@ -13,8 +11,8 @@ from q_audit.physics import idle_infidelity
 pytestmark = pytest.mark.aer
 
 CHANNELS = [
-    # (T1, T2, idle time) -- spans short/long idles, T2<T1, T2>T1, and a
-    # pathological low-T2 qubit like fake_sherbrooke's q84.
+    # (T1, T2, idle). short and long idles, T2<T1, T2>T1, and one horrible
+    # low T2 qubit like sherbrooke's q84
     (100e-6, 80e-6, 1e-6),
     (100e-6, 80e-6, 10e-6),
     (100e-6, 150e-6, 5e-6),
@@ -48,7 +46,7 @@ def test_matches_aer_thermal_relaxation(aer_infidelity, t1, t2, t):
 
 
 def test_matches_aer_after_t2_clamping(aer_infidelity):
-    """Our clamp must reproduce Aer's own T2 <= 2*T1 behaviour."""
+    """our clamp should do the same thing aer does internally"""
     t1, t = 100e-6, 4e-6
     ours = idle_infidelity(t, t1, 10 * t1)
     theirs = aer_infidelity(t1, 2 * t1, t)

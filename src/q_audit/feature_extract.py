@@ -1,45 +1,35 @@
-"""Normalise an input circuit and extract the features the audit needs.
+"""clean up the input circuit and pull out the numbers the audit needs.
 
-The important boundary here is the **unroll**: everything downstream (VF2,
-SABRE, our ESP model) assumes a circuit of 1- and 2-qubit gates.  A 3q+ gate
-that leaks past this point does not raise -- it silently makes ``VF2Layout``
-bail with ``MORE_THAN_2Q`` and the whole audit degrades to a no-op.  So we
-assert instead of hoping.
+the important bit is the unroll. everything after this point (vf2, sabre, our
+esp model) assumes 1q and 2q gates only. a 3q gate sneaking through doesn't
+raise anything, it just makes VF2Layout give up with MORE_THAN_2Q and then the
+whole audit is a no-op. so we check instead of hoping
 """
-
-from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass, field
 
-from qiskit import QuantumCircuit
-from qiskit.circuit import Parameter
 from qiskit.transpiler.preset_passmanagers import common
 
 from .errors import UnsupportedCircuitError
-from .models import CalibrationSnapshot
 
 CONTROL_FLOW_OPS = frozenset({"if_else", "for_loop", "while_loop", "switch_case", "box"})
 _STRUCTURAL_OPS = frozenset({"barrier", "measure", "reset", "delay"})
 
+_ERROR_BEARING_1Q = frozenset(
+    {"sx", "x", "id", "sxdg", "y", "h", "u", "u3", "r", "rx", "ry"}
+)
+
 
 @dataclass(frozen=True)
 class DagOpStats:
-    """Operation counts that drive VF2's scoring exponents.
+    """op counts that end up as vf2's scoring exponents.
 
-    Empirically (see the canary test ``test_vf2_diagonal_exponent_is_one_qubit_op_count``)
-    VF2's average-error scorer computes::
-
-        score = 1 - prod_q (1 - diag[q]) ** n1q(q) * prod_e (1 - edge[e]) ** n2q(e)
-
-    where ``n1q(q)`` counts **every** 1-qubit DAG op on that wire -- including
-    zero-duration ``rz`` frame changes and ``measure`` -- but not barriers, and
-    2-qubit gates contribute only through the off-diagonal term.
-
-    The diagonal is therefore a *per-1q-operation* rate, not a per-qubit total.
-    A raw ``sx + readout + idle`` diagonal is mis-scaled: it multiplies the
-    one-shot readout and idle penalties by however many 1q ops happen to land
-    on that wire.
+    vf2 scores a layout as prod_q (1-diag[q])**n1q(q) * prod_e (1-edge[e])**n2q(e)
+    where n1q counts every 1 qubit op on the wire, including rz frame changes
+    and measure, but not barriers. so the diagonal is a per op rate and not a
+    per qubit total. see test_vf2_diagonal_exponent_is_one_qubit_op_count, i
+    had to check this empirically becuase it isn't documented anywhere
     """
 
     one_qubit_ops: int
@@ -48,21 +38,20 @@ class DagOpStats:
     active_qubits: int
 
     @property
-    def n_bar(self) -> float:
-        """Mean 1q ops per active qubit -- the exponent VF2 will apply."""
+    def n_bar(self):
+        """mean 1q ops per active qubit, ie the exponent vf2 uses"""
         return self.one_qubit_ops / self.active_qubits if self.active_qubits else 0.0
 
     @property
-    def g_bar(self) -> float:
-        """Mean *error-bearing* 1q gates per active qubit."""
+    def g_bar(self):
+        """same but only gates that actually carry error"""
         return self.error_bearing_1q_ops / self.active_qubits if self.active_qubits else 0.0
 
     @property
-    def m_bar(self) -> float:
-        """Mean measurements per active qubit."""
+    def m_bar(self):
         return self.measure_ops / self.active_qubits if self.active_qubits else 0.0
 
-    def to_dict(self) -> dict:
+    def to_dict(self):
         return {
             "one_qubit_ops": self.one_qubit_ops,
             "error_bearing_1q_ops": self.error_bearing_1q_ops,
@@ -74,17 +63,11 @@ class DagOpStats:
         }
 
 
-_ERROR_BEARING_1Q = frozenset(
-    {"sx", "x", "id", "sxdg", "y", "h", "u", "u3", "r", "rx", "ry"}
-)
-
-
-def dag_op_stats(circuit: QuantumCircuit) -> DagOpStats:
-    """Count the ops VF2 will use as scoring exponents."""
+def dag_op_stats(circuit):
     one_q = 0
     err_1q = 0
     measures = 0
-    active: set[int] = set()
+    active = set()
     for inst in circuit.data:
         name = inst.operation.name
         if name == "barrier":
@@ -108,7 +91,7 @@ def dag_op_stats(circuit: QuantumCircuit) -> DagOpStats:
 
 @dataclass
 class CircuitFeatures:
-    """Everything the orchestrator needs to know about the input circuit."""
+    """everything the audit needs to know about the input circuit"""
 
     name: str
     num_qubits: int
@@ -117,17 +100,17 @@ class CircuitFeatures:
     size: int
     two_qubit_gates: int
     two_qubit_depth: int
-    interaction_edges: list[tuple[int, int]]
+    interaction_edges: list
     interaction_degree_max: int
     t_est_s: float
-    bound_parameters: dict[str, float] = field(default_factory=dict)
+    bound_parameters: dict = field(default_factory=dict)
     has_control_flow: bool = False
     has_measurements: bool = False
-    op_counts: dict[str, int] = field(default_factory=dict)
-    op_stats: DagOpStats | None = None
-    notes: list[str] = field(default_factory=list)
+    op_counts: dict = field(default_factory=dict)
+    op_stats: object = None
+    notes: list = field(default_factory=list)
 
-    def to_dict(self) -> dict:
+    def to_dict(self):
         return {
             "name": self.name,
             "num_qubits": self.num_qubits,
@@ -148,24 +131,19 @@ class CircuitFeatures:
         }
 
 
-def _stable_parameter_value(circuit_name: str, param: Parameter) -> float:
-    """Deterministic pseudo-random binding in [0, 2*pi).
-
-    Derived from a hash of (circuit name, parameter name) so the same circuit
-    always gets the same values -- a re-run must be reproducible, and baseline
-    and audited paths must see byte-identical inputs.
-    """
+def _stable_parameter_value(circuit_name, param) -> float:
+    # hash of (circuit name, param name) -> a fixed angle in [0, 2pi). needs to
+    # be the same every run or the two paths aren't comparing the same circuit
     digest = hashlib.sha256(f"{circuit_name}:{param.name}".encode()).digest()
     frac = int.from_bytes(digest[:8], "big") / float(1 << 64)
     return frac * 6.283185307179586
 
 
-def bind_free_parameters(circuit: QuantumCircuit) -> tuple[QuantumCircuit, dict[str, float]]:
-    """Bind unbound parameters to fixed pseudo-random values.
+def bind_free_parameters(circuit):
+    """bind any leftover parameters to fixed pseudo random angles.
 
-    Layout and routing are parameter-independent, but scheduling and ESP are
-    not (a gate's duration can depend on its angle).  Binding deterministically
-    keeps the audit reproducible; the report lists what was bound.
+    layout and routing don't care about angles but scheduling and esp do, since
+    a gate duration can depend on its angle
     """
     params = list(circuit.parameters)
     if not params:
@@ -175,24 +153,23 @@ def bind_free_parameters(circuit: QuantumCircuit) -> tuple[QuantumCircuit, dict[
     return bound, values
 
 
-def detect_control_flow(circuit: QuantumCircuit) -> bool:
+def detect_control_flow(circuit):
     return any(name in CONTROL_FLOW_OPS for name in circuit.count_ops())
 
 
-def unroll_to_basis(circuit: QuantumCircuit, basis_gates: list[str]) -> QuantumCircuit:
-    """Translate to the device gate set *without* applying any connectivity.
+def unroll_to_basis(circuit, basis_gates):
+    """translate to the device gate set without applying any connectivity.
 
-    ``target=None`` is deliberate: passing a target here drags in the coupling
-    map and direction fix-ups, which are meaningless on a circuit that has not
-    been laid out yet.
+    target=None on purpose. passing a target drags in the coupling map and the
+    direction fixups, which mean nothing on a circuit with no layout yet
     """
     pm = common.generate_translation_passmanager(target=None, basis_gates=list(basis_gates))
     return pm.run(circuit)
 
 
-def assert_at_most_two_qubit(circuit: QuantumCircuit) -> None:
-    """Hard gate: nothing wider than 2 qubits may reach the layout passes."""
-    offenders: dict[str, int] = {}
+def assert_at_most_two_qubit(circuit):
+    """nothing wider than 2 qubits gets past here"""
+    offenders = {}
     for inst in circuit.data:
         name = inst.operation.name
         if name == "barrier":
@@ -202,15 +179,15 @@ def assert_at_most_two_qubit(circuit: QuantumCircuit) -> None:
     if offenders:
         listing = ", ".join(f"{k} x{v}" for k, v in sorted(offenders.items()))
         raise UnsupportedCircuitError(
-            f"Circuit still contains gates wider than 2 qubits after unrolling: {listing}.",
-            hint="VF2Layout silently gives up on >2q gates, which would make the "
-            "audit a no-op. Decompose these before auditing.",
+            f"circuit still has gates wider than 2 qubits after unrolling: {listing}",
+            hint="VF2Layout silently gives up on >2q gates so the audit would be a "
+            "no-op. decompose these first.",
         )
 
 
-def interaction_graph(circuit: QuantumCircuit) -> list[tuple[int, int]]:
-    """Undirected 2q interaction edges over *virtual* qubit indices."""
-    edges: set[tuple[int, int]] = set()
+def interaction_graph(circuit):
+    """undirected 2q edges over virtual qubit indices"""
+    edges = set()
     for inst in circuit.data:
         if inst.operation.name in _STRUCTURAL_OPS:
             continue
@@ -223,56 +200,49 @@ def interaction_graph(circuit: QuantumCircuit) -> list[tuple[int, int]]:
     return sorted(edges)
 
 
-def two_qubit_depth(circuit: QuantumCircuit) -> int:
-    """Critical-path depth counting only 2q gates."""
+def two_qubit_depth(circuit) -> int:
+    """depth counting only the 2q gates"""
     return circuit.depth(
         lambda inst: len(inst.qubits) == 2 and inst.operation.name not in _STRUCTURAL_OPS
     )
 
 
-def extract_features(
-    circuit: QuantumCircuit,
-    snapshot: CalibrationSnapshot,
-    *,
-    reject_control_flow: bool = True,
-) -> tuple[QuantumCircuit, QuantumCircuit, CircuitFeatures]:
-    """Prepare a circuit for audit.
+def extract_features(circuit, snapshot, *, reject_control_flow=True):
+    """get a circuit ready to audit.
 
-    Returns ``(bound_original, unrolled, features)``.  The *original* (bound but
-    not unrolled) circuit is what gets fed to the preset pass managers, so both
-    the baseline and audited paths see byte-identical input; the *unrolled* copy
-    exists purely so VF2Layout sees a 1q/2q interaction graph.
+    returns (bound, unrolled, features). the bound-but-not-unrolled one is what
+    goes into the preset pass managers so both paths see identical input. the
+    unrolled copy only exists so vf2 sees a 1q/2q interaction graph
     """
-    notes: list[str] = []
+    notes = []
 
     has_cf = detect_control_flow(circuit)
     if has_cf and reject_control_flow:
         raise UnsupportedCircuitError(
-            "Circuit contains classical control flow "
-            f"({sorted(set(circuit.count_ops()) & CONTROL_FLOW_OPS)}).",
-            hint="The MVP's ESP and idle-time model assumes a single static "
-            "schedule; a branchy circuit has no single duration. Pass "
-            "--allow-control-flow to audit it anyway (numbers become an "
-            "upper bound on the longest branch).",
+            "circuit has classical control flow "
+            f"({sorted(set(circuit.count_ops()) & CONTROL_FLOW_OPS)})",
+            hint="our esp and idle model assumes one static schedule and a branchy "
+            "circuit doesn't have one. pass --allow-control-flow to audit it anyway, "
+            "the numbers become an upper bound on the longest branch.",
         )
     if has_cf:
         notes.append(
-            "Circuit contains control flow: duration and ESP are upper bounds over "
-            "the statically-scheduled longest branch, not the expected value."
+            "circuit has control flow, so duration and esp are an upper bound over the "
+            "longest branch rather than an expected value"
         )
 
     bound, bound_values = bind_free_parameters(circuit)
     if bound_values:
         notes.append(
-            f"Bound {len(bound_values)} free parameter(s) to fixed pseudo-random "
-            "values (seeded by circuit+parameter name) so the audit is reproducible."
+            f"bound {len(bound_values)} free parameter(s) to fixed pseudo-random values "
+            "(seeded by circuit + parameter name) so re-runs match"
         )
 
     unrolled = unroll_to_basis(bound, snapshot.basis_gates)
     assert_at_most_two_qubit(unrolled)
 
     edges = interaction_graph(unrolled)
-    degree: dict[int, int] = {}
+    degree = {}
     for a, b in edges:
         degree[a] = degree.get(a, 0) + 1
         degree[b] = degree.get(b, 0) + 1
@@ -283,13 +253,15 @@ def extract_features(
         if len(inst.qubits) == 2 and inst.operation.name not in _STRUCTURAL_OPS
     )
     tq_depth = two_qubit_depth(unrolled)
+    # rough guess at how long the circuit runs: 2q depth times the typical 2q
+    # gate. not exact but we only need it to size the idle penalty
     median_2q = snapshot.median_two_qubit_duration()
     t_est = tq_depth * median_2q
 
     if t_est <= 0:
         notes.append(
-            "Circuit has no 2-qubit gates: idle-time estimate is zero and the "
-            "injected map reduces to static (1q + readout) error."
+            "circuit has no 2-qubit gates so the idle estimate is zero and the injected "
+            "map is just 1q + readout error"
         )
 
     features = CircuitFeatures(
@@ -313,13 +285,14 @@ def extract_features(
     return bound, unrolled, features
 
 
-def connectivity_summary(features: CircuitFeatures, snapshot: CalibrationSnapshot) -> str:
-    """One line describing how well the circuit's shape fits the device graph."""
+def connectivity_summary(features, snapshot):
+    """one line on how well the circuit shape fits the device graph"""
     n = features.num_qubits
     if not features.interaction_edges:
         return "no 2-qubit interactions"
     density = len(features.interaction_edges) / max(1, n * (n - 1) / 2)
-    device_density = len(snapshot.coupling) / max(1, snapshot.num_qubits * (snapshot.num_qubits - 1) / 2)
+    device_pairs = max(1, snapshot.num_qubits * (snapshot.num_qubits - 1) / 2)
+    device_density = len(snapshot.coupling) / device_pairs
     shape = "dense" if density > 0.5 else "sparse"
     return (
         f"{len(features.interaction_edges)} interaction edges over {n} qubits "

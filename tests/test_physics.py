@@ -1,6 +1,4 @@
-"""Pure-physics unit tests. No Qiskit, no backend, no network."""
-
-from __future__ import annotations
+"""just the math. no qiskit, no backend, no network"""
 
 import math
 
@@ -34,7 +32,7 @@ def test_idle_infidelity_tends_to_zero_as_time_tends_to_zero():
 def test_idle_infidelity_saturates_at_one_half():
     assert idle_infidelity(1.0, T1, T2) == pytest.approx(0.5, abs=1e-9)
     assert idle_infidelity(1e9, T1, T2) == 0.5
-    # Never exceeds the maximally-mixed limit, whatever the inputs.
+    # never above the maximally mixed limit whatever you feed it
     for t in (1e-3, 1.0, 1e6):
         assert 0.0 <= idle_infidelity(t, T1, T2) <= 0.5
 
@@ -48,7 +46,7 @@ def test_idle_infidelity_is_monotone_in_time():
 
 
 def test_idle_infidelity_is_monotone_in_coherence():
-    """A qubit with better T2 must never be penalised more."""
+    """better T2 should never get punished more"""
     t = 5e-6
     worse = idle_infidelity(t, T1, 10e-6)
     better = idle_infidelity(t, T1, 200e-6)
@@ -62,7 +60,7 @@ def test_idle_infidelity_matches_closed_form():
 
 
 def test_idle_infidelity_clamps_t2_internally():
-    """T2 = 5*T1 must be treated as T2 = 2*T1, not taken at face value."""
+    """T2 = 5*T1 has to get clamped, not taken at face value"""
     assert idle_infidelity(1e-6, T1, 5 * T1) == pytest.approx(
         idle_infidelity(1e-6, T1, 2 * T1), rel=1e-12
     )
@@ -72,7 +70,7 @@ def test_idle_infidelity_handles_missing_coherence_data():
     assert idle_infidelity(1e-6, None, None) == 0.5
     assert idle_infidelity(0.0, None, None) == 0.0
     assert idle_infidelity(1e-6, 0.0, 0.0) == 0.5
-    # One good time is still information.
+    # one good time is still information
     assert 0.0 < idle_infidelity(1e-6, T1, None) < 0.5
 
 
@@ -105,7 +103,7 @@ def test_esp_is_zero_for_a_dead_gate():
 
 
 def test_esp_does_not_underflow_to_nonsense():
-    """Thousands of small terms must stay finite and in range."""
+    """thousands of tiny terms, must not underflow to garbage"""
     esp = esp_from_terms([0.001] * 5000, [])
     assert 0.0 <= esp <= 1.0
     assert esp == pytest.approx(math.exp(5000 * math.log(0.999)), rel=1e-9)

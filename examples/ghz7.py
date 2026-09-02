@@ -1,5 +1,5 @@
-"""7-qubit GHZ state. Its interaction graph is a line, so VF2 finds a perfect
-subgraph embedding on heavy-hex -- the layout choice is pure noise-awareness."""
+# 7 qubit ghz. interaction graph is a line so vf2 finds a perfect embedding on
+# heavy-hex, which means the layout choice is purely about noise
 
 from qiskit import QuantumCircuit
 

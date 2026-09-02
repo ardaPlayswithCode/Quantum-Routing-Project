@@ -1,4 +1,4 @@
-"""Deliberately broken: defines no `qc`. Used to exercise the error path."""
+# broken on purpose, there's no `qc` here. used to test the error path
 
 from qiskit import QuantumCircuit
 

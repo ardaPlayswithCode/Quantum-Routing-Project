@@ -1,6 +1,5 @@
-"""q-audit: side-by-side audit of Qiskit's default transpiler vs a T1/T2-aware layout."""
+"""q-audit: transpile a circuit twice, once stock and once with T1/T2 info,
+and show the difference."""
 
 __version__ = "0.1.0"
 SCHEMA_VERSION = "1.0.0"
-
-__all__ = ["__version__", "SCHEMA_VERSION"]

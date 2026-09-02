@@ -1,6 +1,4 @@
-"""Unrolling, the <=2q gate, parameter binding, control flow and t_est."""
-
-from __future__ import annotations
+"""unrolling, the 2q check, parameter binding, control flow, t_est"""
 
 import pytest
 from qiskit import QuantumCircuit
@@ -30,7 +28,7 @@ def test_unroll_leaves_nothing_wider_than_two_qubits(snapshot):
     qc.ccx(0, 1, 2)
     qc.mcx([0, 1, 2], 3)
     unrolled = unroll_to_basis(qc, snapshot.basis_gates)
-    assert_at_most_two_qubit(unrolled)  # must not raise
+    assert_at_most_two_qubit(unrolled)  # shouldn't raise
 
 
 def test_assert_at_most_two_qubit_fires_on_wide_gates():
@@ -45,7 +43,7 @@ def test_assert_at_most_two_qubit_fires_on_wide_gates():
 def test_assert_ignores_wide_barriers():
     qc = QuantumCircuit(5)
     qc.barrier()
-    assert_at_most_two_qubit(qc)  # must not raise
+    assert_at_most_two_qubit(qc)  # shouldn't raise
 
 
 def test_parameter_binding_is_deterministic():
@@ -133,7 +131,7 @@ def test_dag_op_stats_counts():
     qc.ecr(0, 1)
     qc.measure(0, 0)
     stats = dag_op_stats(qc)
-    assert stats.one_qubit_ops == 4  # 2 sx + 1 rz + 1 measure
+    assert stats.one_qubit_ops == 4  # 2 sx + rz + measure
     assert stats.error_bearing_1q_ops == 2
     assert stats.measure_ops == 1
     assert stats.active_qubits == 2

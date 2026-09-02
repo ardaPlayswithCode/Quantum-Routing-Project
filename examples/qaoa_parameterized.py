@@ -1,9 +1,9 @@
-"""A parameterized QAOA-style circuit with *unbound* parameters.
+"""qaoa-ish circuit with unbound parameters.
 
-Demonstrates q-audit's parameter handling: layout and routing do not depend on
-rotation angles, but scheduling and ESP do, so the free parameters are bound to
-fixed pseudo-random values (seeded by circuit + parameter name) and the report
-says so. Re-running gives identical numbers.
+shows what q-audit does with free parameters. layout and routing don't care
+about the angles but scheduling and esp do, so they get bound to fixed
+pseudo-random values (seeded off circuit + parameter name) and the report says
+it did that. re-running gives the same numbers
 """
 
 from qiskit import QuantumCircuit

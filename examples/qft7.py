@@ -1,4 +1,4 @@
-"""7-qubit QFT followed by a full measurement -- the reference demo circuit."""
+# 7 qubit qft, the demo circuit
 
 from qiskit import QuantumCircuit
 from qiskit.circuit.library import QFTGate

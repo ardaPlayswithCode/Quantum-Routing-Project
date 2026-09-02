@@ -1,47 +1,40 @@
-"""Run the two transpilations side by side and measure both.
+"""run the two transpilations side by side and measure both.
 
-Fairness rules baked in here
-----------------------------
-1.  Both paths start from the *same* bound input circuit object.
-2.  Both paths run the *same* preset pass manager at the same optimization
-    level, over the *same* list of seeds.
-3.  Both paths select their winner with the *same* objective (ESP).
-    Giving the baseline one seed and the audited path twenty would manufacture
-    a win out of nothing but extra sampling.
+fairness rules, because otherwise the comparison is worthless:
+both paths start from the same bound circuit object, both run the same preset
+pass manager at the same optimization level over the same seed list, and both
+pick their winner with the same objective (esp). giving the baseline one seed
+and the audited path twenty would manufacture a win out of nothing.
 
-A caveat we state rather than hide: selecting by ESP means the headline ESP
-delta is partly self-fulfilling, because ESP is also what the injected map
-optimises.  The independent check is the Aer Hellinger fidelity in
-``benchmarks/`` -- ESP is the model, Hellinger is the measurement.
+caveat i'm not going to hide: selecting by esp makes the headline esp delta
+partly self fulfilling, since esp is also what the injected map optimises. the
+independent check is the aer hellinger fidelity in benchmarks/. esp is the
+model, hellinger is the measurement.
 
-The two audited strategies
---------------------------
-``vf2_pinned``
-    When VF2Layout (fed our T1/T2 map) finds an *exact* subgraph embedding, we
-    pin it as ``initial_layout``.  Pinning also removes every VF2PostLayout
-    from the preset pass manager, so nothing downstream can quietly overwrite
-    the choice with Qiskit's own error map.  Zero routing overhead by
-    construction -- this is the strategy that wins on sparse circuits.
+there are two audited strategies and which one wins depends on the circuit.
+dense circuits need the relocate thing, sparse ones can just pin the layout:
 
-``post_layout_relocate``
-    Take the baseline's routed circuit and *relocate* it with
-    ``VF2PostLayout(strict_direction=False)`` under our map.  The gate
-    structure, the SWAPs and the depth are untouched; only the physical qubits
-    change.  This is what wins on dense circuits, where the routing SABRE found
-    is worth far more than any layout we could impose on it.
+vf2_pinned, when VF2Layout (fed our map) finds an exact embedding we pin it as
+initial_layout. pinning also strips every VF2PostLayout out of the preset, so
+nothing downstream can overwrite our choice with qiskit's own error map. zero
+routing overhead by construction.
 
-An earlier design pinned the post-layout result as an ``initial_layout`` and
-re-transpiled.  That was measurably wrong: re-routing from a permutation chosen
-for the *routed* interaction graph cost more SWAPs than the better qubits
-saved (-22% ESP on a 7-qubit QFT mirror circuit, confirmed by Aer).  Relocating
-the already-routed circuit is the correct use of VF2PostLayout.
+post_layout_relocate, take the baseline's already routed circuit and move it
+onto better qubits with VF2PostLayout(strict_direction=False). the gates, the
+swaps and the depth all stay the same, only the physical qubits change.
+
+first version of this pinned the post layout result as an initial_layout and
+re-transpiled. that was just wrong: re-routing from a permutation chosen for
+the *routed* interaction graph cost more swaps than the better qubits saved
+(-22% esp on qft mirror 7, aer agreed). relocating the routed circuit is the
+right way to use VF2PostLayout
 """
 
-from __future__ import annotations
-
+import json
+import sys
+import time
 from dataclasses import dataclass, field
 
-from qiskit import QuantumCircuit
 from qiskit.circuit.equivalence_library import SessionEquivalenceLibrary as _SEL
 from qiskit.passmanager.flow_controllers import ConditionalController
 from qiskit.transpiler import PassManager, generate_preset_pass_manager
@@ -57,29 +50,59 @@ from qiskit.transpiler.passes import (
 )
 
 from .errors import InjectionContractError, TranspileAuditError
-from .feature_extract import CircuitFeatures
 from .metrics import SwapCounter, compute_metrics
-from .models import CalibrationSnapshot, MetricSet
-from .passes import ErrorMapBuild, InjectDecoherenceErrorMap, build_decoherence_error_map
-from .progress import NULL_REPORTER, ProgressReporter
-from .scheduling import ScheduleResult
+from .passes import InjectDecoherenceErrorMap, build_decoherence_error_map
 
-# VF2 search budget.  Unbounded search on a 127-qubit device with a dense
-# interaction graph can run for minutes, so the search is capped -- but only by
-# limits that are a deterministic function of the input.
+# how much vf2 search we allow. unbounded search on 127 qubits with a dense
+# interaction graph can run for minutes.
 #
-# `time_limit` is deliberately None. It is a *wall-clock* budget, so a machine
-# under load stops the search at a different point and the audit returns a
-# different layout for the same circuit, seed and calibration. This was not
-# hypothetical: running two benchmark processes concurrently made su2_6x3
-# disagree with itself on 1 of 20 seeds. `call_limit` and `max_trials` bound the
-# same search by work done rather than time elapsed, which is reproducible.
+# time_limit stays None on purpose. it's a wall clock budget, so a loaded
+# machine stops the search somewhere else and you get a different layout for
+# the same circuit and seed. not hypothetical, running two benchmarks at once
+# made su2_6x3 disagree with itself on 1 seed out of 20. call_limit and
+# max_trials bound the same search by work done, which is reproducible
 VF2_CALL_LIMIT = 3_000_000
 VF2_TIME_LIMIT = None
 VF2_MAX_TRIALS = 25_000
 
 STRATEGY_PINNED = "vf2_pinned"
 STRATEGY_RELOCATE = "post_layout_relocate"
+
+
+# --------------------------------------------------------------------------
+# progress events, ndjson on stderr
+# --------------------------------------------------------------------------
+# stdout belongs to the report (and to exactly one json document with --json),
+# so anything chatty goes to stderr instead, one json object per line
+
+
+@dataclass
+class ProgressReporter:
+    enabled: bool = True
+    quiet: bool = False
+    _t0: float = field(default_factory=time.monotonic)
+
+    def emit(self, event, **fields):
+        if not self.enabled or self.quiet:
+            return
+        payload = {"ts": round(time.monotonic() - self._t0, 4), "event": event, **fields}
+        try:
+            sys.stderr.write(json.dumps(payload, default=str) + "\n")
+            sys.stderr.flush()
+        except (OSError, ValueError):
+            pass
+
+    def step(self, name, **fields):
+        self.emit("step", step=name, **fields)
+
+    def warn(self, message, **fields):
+        self.emit("warning", message=message, **fields)
+
+    def error(self, message, **fields):
+        self.emit("error", message=message, **fields)
+
+
+NULL_REPORTER = ProgressReporter(enabled=False)
 
 
 @dataclass
@@ -91,14 +114,14 @@ class AuditSettings:
     optimization_level: int = 3
     schedule_method: str = "asap"
     post_layout_refine: bool = True
-    # "normalized" corrects for VF2 exponentiating the diagonal by the
-    # per-qubit 1q op count; "raw" is the literal design-doc formula.
+    # normalized corrects for vf2 exponentiating the diagonal, raw is the
+    # literal formula
     map_scaling: str = "normalized"
-    # Benchmarks need every seed's circuit to run a paired simulation; the
-    # CLI does not, and 20 x 127-qubit circuits is memory we can skip there.
+    # benchmarks need every seed's circuit to run paired simulations, the cli
+    # doesn't and 20 x 127 qubit circuits is a lot of memory to hold for nothing
     keep_circuits: bool = False
 
-    def seed_list(self) -> list[int]:
+    def seed_list(self):
         if self.seeds < 1:
             raise TranspileAuditError("--seeds must be >= 1")
         return [self.base_seed + i for i in range(self.seeds)]
@@ -106,51 +129,53 @@ class AuditSettings:
 
 @dataclass
 class PathResult:
-    """One transpilation strategy, evaluated over the whole seed list."""
+    """one strategy, evaluated over the whole seed list"""
 
     label: str
-    best: MetricSet
-    best_circuit: QuantumCircuit
-    best_schedule: ScheduleResult
-    all_metrics: list[MetricSet] = field(default_factory=list)
-    all_circuits: list[QuantumCircuit] = field(default_factory=list)
+    best: object
+    best_circuit: object
+    best_schedule: object
+    all_metrics: list = field(default_factory=list)
+    all_circuits: list = field(default_factory=list)
     info: dict = field(default_factory=dict)
 
-    def esp_series(self) -> list[float]:
+    def esp_series(self):
         return [m.esp for m in self.all_metrics]
 
 
 @dataclass
 class AuditResult:
     baseline: PathResult
-    baseline_default: MetricSet
+    baseline_default: object
     audited: PathResult
     audited_strategy: str
-    strategies: dict[str, PathResult]
-    error_map: ErrorMapBuild
+    strategies: dict
+    error_map: object
     layout_info: dict
     settings: AuditSettings
-    warnings: list[str] = field(default_factory=list)
-    notes: list[str] = field(default_factory=list)
+    warnings: list = field(default_factory=list)
+    notes: list = field(default_factory=list)
 
     @property
-    def recommendation(self) -> str:
-        return "adopt_audited" if self.audited.best.esp > self.baseline.best.esp else "keep_baseline"
+    def recommendation(self):
+        if self.audited.best.esp > self.baseline.best.esp:
+            return "adopt_audited"
+        return "keep_baseline"
 
 
 class _SeedTranspileLayout(AnalysisPass):
-    """Replay a finished circuit's TranspileLayout into a fresh property set.
+    """replay a finished circuit's TranspileLayout into a fresh property set.
 
-    ``ApplyLayout`` needs ``layout``/``final_layout``/``original_qubit_indices``
-    to compose a post-layout onto an already-routed circuit; a standalone pass
-    manager starts with none of them.
+    ApplyLayout needs layout/final_layout/original_qubit_indices to compose a
+    post layout onto an already routed circuit, and a standalone pass manager
+    starts with none of those
     """
 
     def __init__(self, transpile_layout):
         super().__init__()
         self._layout = transpile_layout
 
-    def __hash__(self):  # Qiskit hashes every pass __init__ argument.
+    def __hash__(self):  # qiskit hashes every pass argument
         return id(self)
 
     def run(self, dag):
@@ -159,14 +184,14 @@ class _SeedTranspileLayout(AnalysisPass):
         return dag
 
 
-def _direction_fix_passes(target) -> list:
-    """Repair ECR/CX direction after a relocation.
+def _direction_fix_passes(target):
+    """fix ecr/cx direction after a relocation.
 
-    ``VF2PostLayout(strict_direction=False)`` is the only branch that reads our
-    injected map, and it is free to land a 2q gate on the uncalibrated
-    orientation of a coupler.  The circuit is then not ISA-valid -- it fails at
-    scheduling with "Duration of ecr on qubits [...] is not found" -- so the
-    same direction fix-up the preset translation stage runs has to run here.
+    VF2PostLayout(strict_direction=False) is the only branch that reads our map
+    and it's free to put a 2q gate on the uncalibrated orientation of a coupler.
+    the circuit is then not ISA valid and blows up at scheduling with "Duration
+    of ecr on qubits [...] is not found", so we run the same direction fixup the
+    preset translation stage does
     """
     basis = list(target.operation_names)
 
@@ -187,17 +212,12 @@ def _direction_fix_passes(target) -> list:
 
 
 # --------------------------------------------------------------------------
-# Audited strategy 1: pin a VF2 layout chosen under the injected map
+# strategy 1: pin a vf2 layout chosen under our map
 # --------------------------------------------------------------------------
 
 
-def _vf2_layout_from_injection(
-    unrolled: QuantumCircuit,
-    target,
-    inject: InjectDecoherenceErrorMap,
-    seed: int,
-) -> tuple[list[int] | None, str]:
-    """Run ``Inject -> VF2Layout`` and read the chosen physical qubits out."""
+def _vf2_layout_from_injection(unrolled, target, inject, seed):
+    """run inject -> VF2Layout and read the physical qubits back out"""
     pm = PassManager(
         [
             inject,
@@ -214,9 +234,9 @@ def _vf2_layout_from_injection(
     pm.run(unrolled)
     if pm.property_set.get("vf2_avg_error_map") is None:
         raise InjectionContractError(
-            "Injected error map vanished from the property set.",
-            hint="Qiskit's VF2 property-set contract has changed; see "
-            "tests/test_injection_contract.py.",
+            "our error map vanished out of the property set",
+            hint="qiskit's vf2 property set contract changed, see "
+            "tests/test_injection_contract.py",
         )
     reason = str(pm.property_set.get("VF2Layout_stop_reason", "unknown"))
     layout = pm.property_set.get("layout")
@@ -226,33 +246,27 @@ def _vf2_layout_from_injection(
 
 
 # --------------------------------------------------------------------------
-# Audited strategy 2: relocate an already-routed circuit
+# strategy 2: relocate an already routed circuit
 # --------------------------------------------------------------------------
 
 
-def _found_post_layout(property_set) -> bool:
+def _found_post_layout(property_set):
     return property_set["post_layout"] is not None
 
 
-def _relocate(
-    routed: QuantumCircuit,
-    target,
-    inject: InjectDecoherenceErrorMap | None,
-    seed: int,
-) -> tuple[QuantumCircuit, str, bool]:
-    """Move a routed circuit onto better physical qubits, gates untouched.
+def _relocate(routed, target, inject, seed):
+    """move a routed circuit onto better qubits, gates untouched.
 
-    ApplyLayout is gated behind a conditional controller rather than being run
-    from a second pass manager: VF2PostLayout on a 127-qubit target is the
-    expensive step here, and running it twice per seed doubled the cost of the
-    whole relocate sweep for nothing.
+    ApplyLayout sits behind a conditional controller rather than in a second
+    pass manager becuase VF2PostLayout on 127 qubits is the expensive step and
+    running it twice per seed doubled the cost of the whole sweep for nothing
     """
     passes = [_SeedTranspileLayout(getattr(routed, "layout", None))]
     if inject is not None:
         passes.append(inject)
-    # inject=None leaves `vf2_avg_error_map` unset, so VF2PostLayout builds
-    # Qiskit's own average map from the target. That is the control arm: same
-    # relocation machinery, no T1/T2 knowledge. See benchmarks/bench.py --control.
+    # inject=None leaves vf2_avg_error_map unset so VF2PostLayout builds
+    # qiskit's own average map from the target. that's the control arm: same
+    # machinery, no T1/T2. see benchmarks/bench.py --control
     passes += [
         VF2PostLayout(
             target=target,
@@ -275,32 +289,20 @@ def _relocate(
 
 
 # --------------------------------------------------------------------------
-# Sweeps
+# the seed sweeps
 # --------------------------------------------------------------------------
 
 
-def _best_of(
-    metrics: list[MetricSet],
-    circuits: list[QuantumCircuit],
-    schedules: list[ScheduleResult],
-) -> tuple[MetricSet, QuantumCircuit, ScheduleResult]:
+def _best_of(metrics, circuits, schedules):
     index = max(range(len(metrics)), key=lambda i: metrics[i].esp)
     return metrics[index], circuits[index], schedules[index]
 
 
-def _run_baseline_sweep(
-    circuit: QuantumCircuit,
-    backend,
-    target,
-    snapshot: CalibrationSnapshot,
-    settings: AuditSettings,
-    *,
-    reporter: ProgressReporter,
-) -> tuple[PathResult, list[QuantumCircuit], list[int]]:
-    metrics: list[MetricSet] = []
-    circuits: list[QuantumCircuit] = []
-    schedules: list[ScheduleResult] = []
-    swaps: list[int] = []
+def _run_baseline_sweep(circuit, backend, target, snap, settings, *, reporter):
+    metrics = []
+    circuits = []
+    schedules = []
+    swaps = []
     for seed in settings.seed_list():
         pm = generate_preset_pass_manager(
             optimization_level=settings.optimization_level,
@@ -310,7 +312,7 @@ def _run_baseline_sweep(
         counter = SwapCounter()
         transpiled = pm.run(circuit, callback=counter)
         measured, schedule = compute_metrics(
-            transpiled, snapshot, target,
+            transpiled, snap, target,
             label="baseline", seed=seed, swaps=counter.added,
             schedule_method=settings.schedule_method,
         )
@@ -335,19 +337,10 @@ def _run_baseline_sweep(
     return path, circuits, swaps
 
 
-def _run_pinned_sweep(
-    circuit: QuantumCircuit,
-    backend,
-    target,
-    snapshot: CalibrationSnapshot,
-    settings: AuditSettings,
-    layout: list[int],
-    *,
-    reporter: ProgressReporter,
-) -> PathResult:
-    metrics: list[MetricSet] = []
-    circuits: list[QuantumCircuit] = []
-    schedules: list[ScheduleResult] = []
+def _run_pinned_sweep(circuit, backend, target, snap, settings, layout, *, reporter):
+    metrics = []
+    circuits = []
+    schedules = []
     for seed in settings.seed_list():
         pm = generate_preset_pass_manager(
             optimization_level=settings.optimization_level,
@@ -358,7 +351,7 @@ def _run_pinned_sweep(
         counter = SwapCounter()
         transpiled = pm.run(circuit, callback=counter)
         measured, schedule = compute_metrics(
-            transpiled, snapshot, target,
+            transpiled, snap, target,
             label=STRATEGY_PINNED, seed=seed, swaps=counter.added,
             schedule_method=settings.schedule_method,
         )
@@ -382,27 +375,20 @@ def _run_pinned_sweep(
 
 
 def _run_relocate_sweep(
-    baseline_circuits: list[QuantumCircuit],
-    baseline_swaps: list[int],
-    target,
-    snapshot: CalibrationSnapshot,
-    settings: AuditSettings,
-    inject: InjectDecoherenceErrorMap | None,
-    *,
-    reporter: ProgressReporter,
-    label: str = STRATEGY_RELOCATE,
-) -> PathResult:
-    metrics: list[MetricSet] = []
-    circuits: list[QuantumCircuit] = []
-    schedules: list[ScheduleResult] = []
+    baseline_circuits, baseline_swaps, target, snap, settings, inject,
+    *, reporter, label=STRATEGY_RELOCATE,
+):
+    metrics = []
+    circuits = []
+    schedules = []
     moved = 0
-    reasons: dict[str, int] = {}
+    reasons = {}
     for seed, routed, swaps in zip(settings.seed_list(), baseline_circuits, baseline_swaps):
         relocated, reason, did_move = _relocate(routed, target, inject, seed)
         reasons[reason] = reasons.get(reason, 0) + 1
         moved += int(did_move)
         measured, schedule = compute_metrics(
-            relocated, snapshot, target,
+            relocated, snap, target,
             label=label, seed=seed, swaps=swaps,
             schedule_method=settings.schedule_method,
         )
@@ -426,39 +412,31 @@ def _run_relocate_sweep(
 
 
 # --------------------------------------------------------------------------
-# Entry point
+# entry point
 # --------------------------------------------------------------------------
 
 
-def run_audit(
-    bound_circuit: QuantumCircuit,
-    unrolled: QuantumCircuit,
-    features: CircuitFeatures,
-    snapshot: CalibrationSnapshot,
-    backend,
-    settings: AuditSettings,
-    *,
-    reporter: ProgressReporter = NULL_REPORTER,
-) -> AuditResult:
+def run_audit(bound_circuit, unrolled, features, snap, backend, settings,
+              *, reporter=NULL_REPORTER):
     target = backend.target
-    warnings: list[str] = []
-    notes: list[str] = []
+    warnings = []
+    notes = []
 
-    if features.num_qubits > snapshot.num_qubits:
+    if features.num_qubits > snap.num_qubits:
         raise TranspileAuditError(
-            f"Circuit needs {features.num_qubits} qubits but "
-            f"{snapshot.backend_name} has {snapshot.num_qubits}."
+            f"circuit needs {features.num_qubits} qubits but "
+            f"{snap.backend_name} only has {snap.num_qubits}"
         )
 
     build = build_decoherence_error_map(
-        snapshot,
+        snap,
         t_est_s=features.t_est_s,
         alpha=settings.alpha,
         op_stats=features.op_stats,
         scaling=settings.map_scaling,
     )
     inject = InjectDecoherenceErrorMap(
-        snapshot, t_est_s=features.t_est_s, alpha=settings.alpha, build=build
+        snap, t_est_s=features.t_est_s, alpha=settings.alpha, build=build
     )
     reporter.step(
         "error_map_built",
@@ -468,16 +446,15 @@ def run_audit(
         worst=build.worst_qubits(3),
     )
 
-    # ---- baseline (also the substrate for the relocate strategy) ----------
+    # baseline first, the relocate strategy builds on top of its circuits
     reporter.step("sweep_start", path="baseline", seeds=settings.seeds)
     baseline, baseline_circuits, baseline_swaps = _run_baseline_sweep(
-        bound_circuit, backend, target, snapshot, settings, reporter=reporter
+        bound_circuit, backend, target, snap, settings, reporter=reporter
     )
 
-    strategies: dict[str, PathResult] = {}
-    layout_info: dict = {}
+    strategies = {}
+    layout_info = {}
 
-    # ---- strategy 1: pinned VF2 layout -----------------------------------
     layout, reason = _vf2_layout_from_injection(unrolled, target, inject, settings.base_seed)
     layout_info["vf2_stop_reason"] = reason
     layout_info["vf2_layout"] = layout
@@ -485,30 +462,29 @@ def run_audit(
         reporter.step("vf2_layout", layout=layout, reason=reason)
         reporter.step("sweep_start", path=STRATEGY_PINNED, seeds=settings.seeds)
         strategies[STRATEGY_PINNED] = _run_pinned_sweep(
-            bound_circuit, backend, target, snapshot, settings, layout, reporter=reporter
+            bound_circuit, backend, target, snap, settings, layout, reporter=reporter
         )
     else:
         notes.append(
             "VF2Layout found no exact subgraph embedding for this interaction graph "
-            f"({reason}), so no zero-SWAP layout exists: the audit falls back to "
-            "relocating SABRE's routed circuit onto better qubits."
+            f"({reason}), so there's no zero-swap layout to pin. falling back to "
+            "relocating sabre's routed circuit onto better qubits."
         )
         reporter.step("vf2_layout_none", reason=reason)
 
-    # ---- strategy 2: relocate the routed circuit -------------------------
     if settings.post_layout_refine:
         reporter.step("sweep_start", path=STRATEGY_RELOCATE, seeds=settings.seeds)
         strategies[STRATEGY_RELOCATE] = _run_relocate_sweep(
-            baseline_circuits, baseline_swaps, target, snapshot, settings, inject,
+            baseline_circuits, baseline_swaps, target, snap, settings, inject,
             reporter=reporter,
         )
 
     if not strategies:
         raise TranspileAuditError(
-            "No audited strategy was available: VF2Layout found nothing and "
-            "post-layout relocation was disabled.",
-            hint="Drop --no-post-layout, or audit a circuit whose interaction "
-            "graph embeds in the device.",
+            "no audited strategy left: vf2 found nothing and post layout relocation "
+            "was turned off",
+            hint="drop --no-post-layout, or audit a circuit whose interaction graph "
+            "actually embeds in the device",
         )
 
     audited_strategy = max(strategies, key=lambda k: strategies[k].best.esp)
@@ -517,6 +493,7 @@ def run_audit(
     layout_info["strategy_esp"] = {k: v.best.esp for k, v in strategies.items()}
     layout_info["final_layout"] = list(audited.best.layout)
     layout_info["source"] = audited_strategy
+
     layout_info.update(audited.info)
 
     baseline_default = next(
@@ -526,10 +503,9 @@ def run_audit(
 
     if audited.best.esp <= baseline.best.esp:
         notes.append(
-            "The audited layout did not beat the baseline on ESP for this circuit. "
-            "That is a real result, not a failure: on a well-calibrated device a "
-            "compact SABRE layout can already sit on good qubits. Recommendation: "
-            "keep the baseline transpilation."
+            "the audited layout didn't beat the baseline on esp here. that's a real "
+            "result and not a failure, on a well calibrated device a compact sabre "
+            "layout can already be sitting on good qubits. keep the baseline."
         )
 
     return AuditResult(
@@ -546,38 +522,23 @@ def run_audit(
     )
 
 
-def run_control_relocation(
-    baseline_circuits: list[QuantumCircuit],
-    baseline_swaps: list[int],
-    target,
-    snapshot: CalibrationSnapshot,
-    settings: AuditSettings,
-    *,
-    reporter: ProgressReporter = NULL_REPORTER,
-) -> PathResult:
-    """Control arm: relocate with **Qiskit's own** error map, no injection.
+def run_control_relocation(baseline_circuits, baseline_swaps, target, snap, settings,
+                           *, reporter=NULL_REPORTER):
+    """control arm: same relocation but with qiskit's own error map.
 
-    Isolates how much of the measured gain comes from running a non-strict
-    ``VF2PostLayout`` at all (the preset only ever runs a *strict* one in its
-    optimization stage, which searches a far smaller space) versus how much
-    comes from the T1/T2 information we inject. Without this control the two
-    effects are confounded.
+    tells us how much of the gain is just "we ran a non-strict VF2PostLayout at
+    all" (the preset only ever runs a strict one, which searches a way smaller
+    space) versus how much is the T1/T2 we inject. without this the two effects
+    are confounded
     """
     return _run_relocate_sweep(
-        baseline_circuits, baseline_swaps, target, snapshot, settings, None,
+        baseline_circuits, baseline_swaps, target, snap, settings, None,
         reporter=reporter, label="relocate_default_map",
     )
 
 
-def run_baseline_only(
-    bound_circuit: QuantumCircuit,
-    backend,
-    snapshot: CalibrationSnapshot,
-    settings: AuditSettings,
-    *,
-    reporter: ProgressReporter = NULL_REPORTER,
-) -> tuple[PathResult, list[QuantumCircuit], list[int]]:
-    """Baseline sweep on its own, for harnesses that need the routed circuits."""
+def run_baseline_only(bound_circuit, backend, snap, settings, *, reporter=NULL_REPORTER):
+    """just the baseline sweep, for harnesses that want the routed circuits"""
     return _run_baseline_sweep(
-        bound_circuit, backend, backend.target, snapshot, settings, reporter=reporter
+        bound_circuit, backend, backend.target, snap, settings, reporter=reporter
     )

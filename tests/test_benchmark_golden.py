@@ -1,15 +1,12 @@
-"""Golden-metric regression gate.
+"""regression gate against benchmarks/golden.json.
 
-``benchmarks/golden.json`` records what the audit produced on a known-good run.
-This test re-derives the same numbers for a small, fast subset and fails if any
-of them regress by more than 2%.  It is skipped (not failed) when the golden
-file is absent, so a fresh clone is not blocked on running the benchmark first.
+golden.json is what the audit produced on a run i know was good. this redoes a
+small fast subset of it and complains if anything drops more than 2%. skips
+rather than fails if the file isn't there, so a fresh clone doesn't have to run
+the benchmark before it can run the tests.
 
-Regenerate with:
-    python benchmarks/bench.py --seeds 20 --shots 16384 --write-golden
+regenerate with: python benchmarks/bench.py --seeds 20 --shots 16384 --write-golden
 """
-
-from __future__ import annotations
 
 import json
 from pathlib import Path
@@ -19,9 +16,9 @@ import pytest
 pytestmark = pytest.mark.slow
 
 GOLDEN = Path(__file__).resolve().parents[1] / "benchmarks" / "golden.json"
-REGRESSION_TOLERANCE = 0.02  # 2%
+REGRESSION_TOLERANCE = 0.02  # 2%, anything worse than that is a real regression
 
-# Kept small: this is a gate, not the benchmark itself.
+# only two circuits, this is a gate and not the benchmark itself
 CHECKED = ["ghz7", "qft_mirror7"]
 
 
@@ -62,8 +59,8 @@ def test_no_esp_regression_against_golden(name, golden, snapshot, fake_backend):
         f"{name}: audited ESP regressed {100 * (got / want - 1):.2f}% "
         f"({want:.5f} -> {got:.5f})"
     )
-    # The baseline is Qiskit's, not ours; a change there means the environment
-    # moved and the golden file needs regenerating, so say so explicitly.
+    # the baseline is qiskit's own number, not ours. if that moved then the
+    # environment changed and golden.json needs regenerating
     assert result.baseline.best.esp == pytest.approx(
         expected["esp_baseline"], rel=1e-6
     ), "baseline ESP moved: Qiskit or the calibration snapshot changed"

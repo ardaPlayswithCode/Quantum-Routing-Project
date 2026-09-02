@@ -1,54 +1,62 @@
-"""Rendering: the rich side-by-side table, the topology map, and the JSON payload."""
-
-from __future__ import annotations
+"""drawing the side by side table, the topology map and the json payload"""
 
 import datetime as _dt
-from collections.abc import Callable
 
-from rich.console import Console
+from pydantic import BaseModel, Field
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
 from . import SCHEMA_VERSION, __version__
-from .feature_extract import CircuitFeatures, connectivity_summary
-from .metrics import unusable_instructions, worst_idle_penalty
-from .models import AuditReport, CalibrationSnapshot, MetricSet
+from .feature_extract import connectivity_summary
+from .metrics import MetricSet, unusable_instructions, worst_idle_penalty
 from .topology import legend_lines, render_topology
-from .transpile_audit import AuditResult
 
 _US = 1e6
 
 
-def _pct(new: float, old: float) -> float | None:
+class AuditReport(BaseModel):
+    """what `q-audit run --json` prints"""
+
+    schema_version: str
+    tool_version: str
+    generated_at: _dt.datetime
+    circuit: dict
+    backend: dict
+    calibration: dict
+    settings: dict
+    baseline: MetricSet
+    baseline_default_seed: MetricSet
+    audited: MetricSet
+    comparison: dict
+    warnings: list[str] = Field(default_factory=list)
+    notes: list[str] = Field(default_factory=list)
+
+
+def _pct(new, old):
     if old == 0:
         return None
     return 100.0 * (new / old - 1.0)
 
 
-def _fmt_delta(
-    baseline: float | None,
-    audited: float | None,
-    *,
-    lower_is_better: bool,
-    fmt: str = "{:+.1f}",
-    as_percent: bool = False,
-    unit: str = "",
-) -> Text:
+def _fmt_delta(baseline, audited, *, lower_is_better, fmt="{:+.1f}",
+               as_percent=False, unit=""):
     if baseline is None or audited is None:
         return Text("--", style="grey50")
     if as_percent:
         pct = _pct(audited, baseline)
         if pct is None:
-            # A zero baseline is not "no change"; it means the baseline circuit
-            # cannot succeed at all, so any positive audited value is an
-            # infinite relative improvement. Saying "0.00%" would be a lie.
+            # a zero baseline isn't "no change", it means the baseline circuit
+            # can't succeed at all, so anything positive is an infinite gain.
+            # printing 0.00% here would be a lie
             if audited > 0:
                 return Text("from zero", style="bold green")
             return Text("--", style="grey50")
-        value, suffix = pct, "%"
+        value = pct
+        suffix = "%"
     else:
-        value, suffix = audited - baseline, unit
+        value = audited - baseline
+        suffix = unit
     if abs(value) < 1e-12:
         return Text("same", style="grey50")
     better = (value < 0) if lower_is_better else (value > 0)
@@ -56,20 +64,8 @@ def _fmt_delta(
     return Text(f"{arrow} {fmt.format(value)}{suffix}", style="green" if better else "red")
 
 
-def _row(
-    table: Table,
-    label: str,
-    baseline: MetricSet,
-    audited: MetricSet,
-    getter: Callable[[MetricSet], float | None],
-    *,
-    fmt: str = "{:.0f}",
-    lower_is_better: bool = True,
-    scale: float = 1.0,
-    as_percent: bool = False,
-    unit: str = "",
-    emphasise: bool = False,
-) -> None:
+def _row(table, label, baseline, audited, getter, *, fmt="{:.0f}",
+         lower_is_better=True, scale=1.0, as_percent=False, unit="", emphasise=False):
     b = getter(baseline)
     a = getter(audited)
     bs = "--" if b is None else fmt.format(b * scale)
@@ -86,11 +82,12 @@ def _row(
     table.add_row(Text(label, style=style), Text(bs, style=style), Text(as_, style=style), delta)
 
 
-def build_table(result: AuditResult, snapshot: CalibrationSnapshot) -> Table:
-    b, a = result.baseline.best, result.audited.best
+def build_table(result, snapshot):
+    b = result.baseline.best
+    a = result.audited.best
     n = result.settings.seeds
     table = Table(
-        title="Transpilation audit — baseline vs T1/T2-aware layout",
+        title="Transpilation audit: baseline vs T1/T2-aware layout",
         title_style="bold",
         header_style="bold cyan",
         show_lines=False,
@@ -133,12 +130,7 @@ def build_table(result: AuditResult, snapshot: CalibrationSnapshot) -> Table:
     return table
 
 
-def build_header(
-    result: AuditResult,
-    snapshot: CalibrationSnapshot,
-    features: CircuitFeatures,
-    origin: str,
-) -> Panel:
+def build_header(result, snapshot, features, origin):
     age_h = snapshot.age_hours()
     age = f"{age_h:.1f}h" if age_h < 48 else f"{age_h / 24:.0f}d"
     lines = [
@@ -147,7 +139,8 @@ def build_header(
         f"{features.two_qubit_gates} two-qubit gates, {connectivity_summary(features, snapshot)}",
         f"[bold]backend[/]      {snapshot.backend_name}  ({snapshot.num_qubits} qubits, "
         f"{len(snapshot.coupling)} couplers)",
-        f"[bold]calibration[/]  source={snapshot.source}  captured={snapshot.captured_at:%Y-%m-%d %H:%M %Z}  age={age}",
+        f"[bold]calibration[/]  source={snapshot.source}  "
+        f"captured={snapshot.captured_at:%Y-%m-%d %H:%M %Z}  age={age}",
         f"[bold]settings[/]     alpha={result.settings.alpha}  seeds={result.settings.seeds} "
         f"(base {result.settings.base_seed})  opt_level={result.settings.optimization_level}  "
         f"schedule={result.settings.schedule_method}  map={result.error_map.scaling}",
@@ -158,9 +151,9 @@ def build_header(
     return Panel("\n".join(lines), title="q-audit", title_align="left", border_style="cyan")
 
 
-def build_idle_table(result: AuditResult, snapshot: CalibrationSnapshot) -> Table:
+def build_idle_table(result, snapshot):
     table = Table(
-        title="Worst idle windows (audited circuit) — where coherence is being spent",
+        title="Worst idle windows (audited circuit), ie where coherence is going",
         title_style="bold",
         header_style="bold cyan",
     )
@@ -180,27 +173,21 @@ def build_idle_table(result: AuditResult, snapshot: CalibrationSnapshot) -> Tabl
     return table
 
 
-def render_terminal(
-    result: AuditResult,
-    snapshot: CalibrationSnapshot,
-    features: CircuitFeatures,
-    origin: str,
-    console: Console,
-    *,
-    show_topology: bool = True,
-) -> None:
+def render_terminal(result, snapshot, features, origin, console, *, show_topology=True):
     console.print(build_header(result, snapshot, features, origin))
     console.print(build_table(result, snapshot))
 
-    b, a = result.baseline.best, result.audited.best
+    b = result.baseline.best
+    a = result.audited.best
     console.print(
         f"\n[bold]baseline layout[/] (seed {b.seed}): "
         + " ".join(str(q) for q in b.layout)
     )
+    same = "   [grey62](identical to baseline)[/]" if a.layout == b.layout else ""
     console.print(
         f"[bold]audited  layout[/] (seed {a.seed}): "
         + " ".join(str(q) for q in a.layout)
-        + ("   [grey62](identical to baseline)[/]" if a.layout == b.layout else "")
+        + same
     )
 
     for label, path in (("baseline", result.baseline), ("audited", result.audited)):
@@ -210,27 +197,24 @@ def render_terminal(
                 f"{d['instruction']}{tuple(d['qubits'])} err={d['error']:.3f}"
                 for d in dead[:4]
             )
+            extra = f" (+{len(dead) - 4} more)" if len(dead) > 4 else ""
+            console.print(f"\n[bold red]DEAD HARDWARE on the {label} layout:[/] {listing}{extra}")
             console.print(
-                f"\n[bold red]DEAD HARDWARE on the {label} layout:[/] {listing}"
-                + (f" (+{len(dead) - 4} more)" if len(dead) > 4 else "")
-            )
-            console.print(
-                "[red]The calibration reports these as unusable; this circuit "
-                "cannot succeed as routed.[/]"
+                "[red]calibration says these are unusable, this circuit cannot "
+                "succeed as routed.[/]"
             )
 
-    verdict = result.recommendation
-    if verdict == "adopt_audited":
+    if result.recommendation == "adopt_audited":
         gain = _pct(a.esp, b.esp)
         change = f"{gain:+.2f}%" if gain is not None else "baseline ESP was zero"
         console.print(
             f"\n[bold green]VERDICT: adopt the audited layout[/] "
-            f"— ESP {b.esp:.4f} -> {a.esp:.4f} ({change}) via {result.audited_strategy}"
+            f"- ESP {b.esp:.4f} -> {a.esp:.4f} ({change}) via {result.audited_strategy}"
         )
     else:
         console.print(
-            "\n[bold yellow]VERDICT: keep the baseline[/] — the T1/T2-aware layout "
-            f"did not improve ESP here ({b.esp:.4f} vs {a.esp:.4f})."
+            "\n[bold yellow]VERDICT: keep the baseline[/] - the T1/T2-aware layout "
+            f"didn't improve ESP here ({b.esp:.4f} vs {a.esp:.4f})."
         )
     if len(result.strategies) > 1:
         detail = "  ".join(
@@ -254,13 +238,12 @@ def render_terminal(
     console.print(build_idle_table(result, snapshot))
 
     default = result.baseline_default
-    best = result.baseline.best
-    if default.esp != best.esp:
+    if default.esp != result.baseline.best.esp:
         console.print(
-            f"\n[grey62]Stock single-seed baseline (seed {default.seed}): "
-            f"ESP {default.esp:.4f}; the table's baseline is the best of "
-            f"{result.settings.seeds} seeds ({best.esp:.4f}) so both paths get the "
-            f"same sampling budget.[/]"
+            f"\n[grey62]stock single-seed baseline (seed {default.seed}): "
+            f"ESP {default.esp:.4f}. the table's baseline is the best of "
+            f"{result.settings.seeds} seeds ({result.baseline.best.esp:.4f}) so both "
+            f"paths get the same sampling budget.[/]"
         )
 
     unknown = set(result.baseline.best_schedule.unknown_durations) | set(
@@ -268,9 +251,9 @@ def render_terminal(
     )
     if unknown:
         console.print(
-            f"[yellow]! No duration in the target for {sorted(unknown)}; those "
-            "instructions were treated as instantaneous, so duration and idle "
-            "time are underestimates.[/]"
+            f"[yellow]! no duration in the target for {sorted(unknown)}, those "
+            "instructions were treated as instant so duration and idle time are "
+            "underestimates.[/]"
         )
 
     for warning in result.warnings:
@@ -279,9 +262,10 @@ def render_terminal(
         console.print(f"[grey62]. {note}[/]")
 
 
-def comparison_dict(result: AuditResult, snapshot: CalibrationSnapshot | None = None) -> dict:
-    b, a = result.baseline.best, result.audited.best
-    dead: dict = {}
+def comparison_dict(result, snapshot=None):
+    b = result.baseline.best
+    a = result.audited.best
+    dead = {}
     if snapshot is not None:
         dead = {
             "baseline_unusable_instructions": unusable_instructions(
@@ -291,6 +275,10 @@ def comparison_dict(result: AuditResult, snapshot: CalibrationSnapshot | None = 
                 result.audited.best_circuit, snapshot
             ),
         }
+    if a.worst_t2_on_layout_s is None or b.worst_t2_on_layout_s is None:
+        worst_t2_delta = None
+    else:
+        worst_t2_delta = a.worst_t2_on_layout_s - b.worst_t2_on_layout_s
     return {
         **dead,
         "esp_baseline": b.esp,
@@ -304,11 +292,7 @@ def comparison_dict(result: AuditResult, snapshot: CalibrationSnapshot | None = 
         "swap_delta": a.swap_gates - b.swap_gates,
         "duration_delta_s": a.duration_s - b.duration_s,
         "idle_delta_s": a.total_idle_s - b.total_idle_s,
-        "worst_t2_delta_s": (
-            None
-            if a.worst_t2_on_layout_s is None or b.worst_t2_on_layout_s is None
-            else a.worst_t2_on_layout_s - b.worst_t2_on_layout_s
-        ),
+        "worst_t2_delta_s": worst_t2_delta,
         "audited_wins": a.esp > b.esp,
         "recommendation": result.recommendation,
         "audited_strategy": result.audited_strategy,
@@ -323,13 +307,7 @@ def comparison_dict(result: AuditResult, snapshot: CalibrationSnapshot | None = 
     }
 
 
-def build_json_report(
-    result: AuditResult,
-    snapshot: CalibrationSnapshot,
-    features: CircuitFeatures,
-    origin: str,
-    warnings: list[str],
-) -> AuditReport:
+def build_json_report(result, snapshot, features, origin, warnings):
     return AuditReport(
         schema_version=SCHEMA_VERSION,
         tool_version=__version__,

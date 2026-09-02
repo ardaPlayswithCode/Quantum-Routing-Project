@@ -1,6 +1,5 @@
-"""CLI contract: stdout purity, JSON validity (including on failure), exit codes."""
-
-from __future__ import annotations
+"""cli contract: nothing but the report on stdout, valid json even when it
+fails, and the right exit codes"""
 
 import json
 
@@ -34,7 +33,7 @@ def test_json_run_exits_clean(json_result):
 
 
 def test_json_stdout_is_exactly_one_document(json_result):
-    payload = json.loads(json_result.stdout)  # raises if stdout is polluted
+    payload = json.loads(json_result.stdout)  # blows up if anything else got printed
     assert isinstance(payload, dict)
 
 
@@ -101,7 +100,7 @@ def test_progress_is_ndjson_on_stderr(examples_dir):
     lines = [line for line in result.stderr.splitlines() if line.strip()]
     assert lines, "no progress emitted"
     for line in lines:
-        event = json.loads(line)  # every stderr line must be a JSON object
+        event = json.loads(line)  # every stderr line has to be one json object
         assert "event" in event and "ts" in event
     assert any(json.loads(line)["event"] == "step" for line in lines)
 
@@ -131,7 +130,7 @@ def test_topology_map_is_drawn_by_default(examples_dir):
 
 
 # ---------------------------------------------------------------------------
-# Failure paths must still honour the output contract
+# failure paths, these still have to honour the output contract
 # ---------------------------------------------------------------------------
 
 
@@ -208,8 +207,8 @@ def test_calibration_subcommand_human():
     assert "127 qubits" in result.stdout
 
 
-def _stale_live(monkeypatch, hours: float):
-    """Make resolve_calibration hand back a fake backend labelled as stale live data."""
+def _stale_live(monkeypatch, hours):
+    """make resolve_calibration hand back a fake backend pretending to be old live data"""
     import datetime as _dt
 
     from q_audit import cli as cli_module
@@ -265,7 +264,7 @@ def test_json_reports_a_recommendation(examples_dir):
 
 
 def test_qasm_stdin_end_to_end(examples_dir):
-    # CliRunner installs its own stdin, so feed it through `input=`.
+    # CliRunner swaps out stdin so you have to use input= here
     result = runner.invoke(
         app, ["run", "-", "--json", *FAST], input=(examples_dir / "bell.qasm").read_text()
     )
@@ -309,7 +308,7 @@ def test_bad_map_scaling_is_a_clean_error(examples_dir):
 
 
 def test_json_flags_dead_hardware_on_the_trivial_layout(examples_dir):
-    """-O 1 uses TrivialLayout, which on fake_sherbrooke hits a dead coupler."""
+    """-O 1 uses TrivialLayout which on sherbrooke lands on a dead coupler"""
     result = runner.invoke(
         app,
         ["run", str(examples_dir / "ghz7.py"), "--json", "-O", "1", "--seeds", "2",
@@ -317,10 +316,10 @@ def test_json_flags_dead_hardware_on_the_trivial_layout(examples_dir):
     )
     assert result.exit_code == 0
     comparison = json.loads(result.stdout)["comparison"]
-    assert comparison["baseline_unusable_instructions"], "dead coupler not reported"
+    assert comparison["baseline_unusable_instructions"], "dead coupler went unreported"
     assert comparison["audited_unusable_instructions"] == []
     assert comparison["esp_baseline"] == 0.0
-    # A zero baseline has no meaningful percentage; the field must say so.
+    # percentage off a zero baseline is meaningless, field should say None
     assert comparison["esp_delta_pct"] is None
     assert comparison["recommendation"] == "adopt_audited"
 

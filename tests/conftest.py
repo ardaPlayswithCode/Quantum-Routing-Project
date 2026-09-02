@@ -1,8 +1,8 @@
-"""Shared fixtures. Backend construction is session-scoped: instantiating
-FakeSherbrooke parses a 127-qubit calibration file and is far too slow to
-repeat per test."""
+"""shared fixtures.
 
-from __future__ import annotations
+the backend ones are session scoped becuase building FakeSherbrooke parses a
+127 qubit calibration file and doing that per test made the suite crawl
+"""
 
 import sys
 import warnings

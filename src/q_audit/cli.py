@@ -1,15 +1,11 @@
-"""``q-audit`` command line interface.
+"""the command line interface.
 
-Output contract
----------------
-* stdout carries the report, and with ``--json`` carries exactly one JSON
-  document -- including on failure, so ``q-audit ... --json | jq`` never sees
-  a truncated stream.
-* stderr carries NDJSON progress events and human-readable errors.
-* exit codes: 0 ok, 2 user error, 3 calibration error, 4 transpiler error.
+output rules, which the tests check: stdout gets the report, and with --json it
+gets exactly one json document and nothing else, even when things fail, so that
+`q-audit ... --json | jq` never sees half a stream. stderr gets the progress
+lines and any error. exit codes are 0 ok, 2 user error, 3 calibration, 4
+transpiler
 """
-
-from __future__ import annotations
 
 import json
 import sys
@@ -24,20 +20,18 @@ from .circuit_loader import load_circuit
 from .errors import QAuditError, TranspileAuditError
 from .feature_extract import extract_features
 from .passes import error_map_is_supported
-from .progress import ProgressReporter
 from .report import build_json_report, render_terminal
-from .transpile_audit import AuditSettings, run_audit
+from .transpile_audit import AuditSettings, ProgressReporter, run_audit
 
 app = typer.Typer(
     add_completion=False,
     no_args_is_help=True,
-    help="Audit a quantum circuit's transpilation: Qiskit defaults vs a "
-    "T1/T2-aware layout, side by side.",
+    help="Audit a circuit's transpilation: qiskit defaults vs a T1/T2-aware layout.",
 )
 
 
-def _fail(exc: QAuditError, *, as_json: bool, console: Console) -> None:
-    """Emit a failure the caller can always parse, then exit with its code."""
+def _fail(exc, *, as_json, console):
+    """print the failure in whichever format the caller asked for, then exit"""
     if as_json:
         payload = {
             "schema_version": SCHEMA_VERSION,
@@ -84,14 +78,10 @@ def run(
     ] = "asap",
     map_scaling: Annotated[
         str,
-        typer.Option(
-            "--map-scaling",
-            help="Diagonal scaling for the injected map: 'normalized' (corrects for "
-            "VF2's per-op exponent) or 'raw'.",
-        ),
+        typer.Option("--map-scaling", help="Diagonal scaling of the injected map: normalized or raw."),
     ] = "normalized",
     no_post_layout: Annotated[
-        bool, typer.Option("--no-post-layout", help="Skip the VF2PostLayout refinement rounds.")
+        bool, typer.Option("--no-post-layout", help="Skip the VF2PostLayout relocate strategy.")
     ] = False,
     topology: Annotated[
         bool, typer.Option("--topology/--no-topology", help="Draw the ASCII device map.")
@@ -105,7 +95,7 @@ def run(
     verify: Annotated[
         bool,
         typer.Option("--verify", help="Also simulate both circuits with Aer and report "
-                     "Hellinger fidelity (needs qiskit-aer; slow)."),
+                     "Hellinger fidelity (needs qiskit-aer, slow)."),
     ] = False,
     shots: Annotated[int, typer.Option("--shots", help="Shots for --verify.")] = 8192,
     quiet: Annotated[bool, typer.Option("--quiet", "-q", help="Silence stderr progress.")] = False,
@@ -116,27 +106,25 @@ def run(
     reporter = ProgressReporter(quiet=quiet)
 
     try:
-        _validate_choices(
-            alpha=alpha, seeds=seeds, schedule=schedule, map_scaling=map_scaling
-        )
+        _validate_choices(alpha=alpha, seeds=seeds, schedule=schedule, map_scaling=map_scaling)
         if not error_map_is_supported():
             raise TranspileAuditError(
-                "This Qiskit build no longer exposes the VF2 'vf2_avg_error_map' hook.",
-                hint="q-audit pins qiskit==2.5.1 for exactly this reason; check your env.",
+                "this qiskit build doesn't expose the vf2 'vf2_avg_error_map' hook anymore",
+                hint="we pin qiskit==2.5.1 for exactly this reason, check your env",
             )
 
         reporter.step("load_circuit", source=circuit)
         qc, origin = load_circuit(circuit)
 
         reporter.step("resolve_calibration", backend=backend)
-        snapshot, backend_obj = resolve_calibration(backend, refresh=refresh)
-        warnings = check_staleness(snapshot, allow_stale=allow_stale)
+        snap, backend_obj = resolve_calibration(backend, refresh=refresh)
+        warnings = check_staleness(snap, allow_stale=allow_stale)
         for warning in warnings:
             reporter.warn(warning)
 
         reporter.step("extract_features")
         bound, unrolled, features = extract_features(
-            qc, snapshot, reject_control_flow=not allow_control_flow
+            qc, snap, reject_control_flow=not allow_control_flow
         )
 
         settings = AuditSettings(
@@ -150,65 +138,62 @@ def run(
             map_scaling=map_scaling,
         )
         result = run_audit(
-            bound, unrolled, features, snapshot, backend_obj, settings, reporter=reporter
+            bound, unrolled, features, snap, backend_obj, settings, reporter=reporter
         )
 
         if verify:
             _attach_verification(result, backend_obj, bound, shots, reporter)
 
         if as_json:
-            report = build_json_report(result, snapshot, features, origin, warnings)
+            report = build_json_report(result, snap, features, origin, warnings)
             sys.stdout.write(report.model_dump_json(indent=2) + "\n")
         else:
             result.warnings.extend(warnings)
-            render_terminal(
-                result, snapshot, features, origin, console, show_topology=topology
-            )
+            render_terminal(result, snap, features, origin, console, show_topology=topology)
         reporter.step("done")
     except QAuditError as exc:
         reporter.error(exc.message)
         _fail(exc, as_json=as_json, console=err_console)
-    except KeyboardInterrupt:  # pragma: no cover
+    except KeyboardInterrupt:
         raise typer.Exit(code=130) from None
-    except Exception as exc:  # noqa: BLE001 - last-resort guard keeps the contract
+    except Exception as exc:
+        # catch all so --json still gets one document out no matter what
         reporter.error(f"{type(exc).__name__}: {exc}")
         wrapped = TranspileAuditError(
-            f"Unexpected {type(exc).__name__}: {exc}",
-            hint="This is a bug in q-audit or Qiskit API drift; re-run with --quiet off "
-            "to see the progress trail.",
+            f"unexpected {type(exc).__name__}: {exc}",
+            hint="that's a bug in q-audit, or qiskit changed under us. re-run without "
+            "--quiet to see the progress trail.",
         )
         _fail(wrapped, as_json=as_json, console=err_console)
 
 
-def _validate_choices(*, alpha: float, seeds: int, schedule: str, map_scaling: str) -> None:
-    """Turn bad flags into exit-2 user errors, not exit-4 "unexpected" crashes."""
-    from .errors import QAuditError as _E
-
+def _validate_choices(*, alpha, seeds, schedule, map_scaling):
+    """turn bad flags into exit-2 user errors instead of exit-4 crashes"""
     if alpha < 0:
-        raise _E("--alpha must be >= 0.", hint="0 disables the idle-decoherence term.")
+        raise QAuditError("--alpha can't be negative", hint="0 turns the idle term off")
     if seeds < 1:
-        raise _E("--seeds must be >= 1.")
+        raise QAuditError("--seeds must be at least 1")
     if schedule.lower() not in ("asap", "alap"):
-        raise _E(f"--schedule must be 'asap' or 'alap', got {schedule!r}.")
+        raise QAuditError(f"--schedule has to be 'asap' or 'alap', got {schedule!r}")
     if map_scaling.lower() not in ("raw", "normalized"):
-        raise _E(
-            f"--map-scaling must be 'normalized' or 'raw', got {map_scaling!r}.",
-            hint="'normalized' corrects for VF2 exponentiating the diagonal by "
-            "the per-qubit 1q op count.",
+        raise QAuditError(
+            f"--map-scaling has to be 'normalized' or 'raw', got {map_scaling!r}",
+            hint="normalized corrects for vf2 exponentiating the diagonal by the "
+            "per qubit 1q op count",
         )
 
 
-def _attach_verification(result, backend_obj, bound, shots: int, reporter) -> None:
-    """Run the Aer harness and fold Hellinger fidelity into both MetricSets."""
+def _attach_verification(result, backend_obj, bound, shots, reporter):
+    """run the aer harness and stick the fidelity onto both metric sets"""
     from .verify import ensure_measured, ideal_distribution, require_aer, simulated_fidelity
 
-    require_aer()  # clean, typed error instead of a raw ImportError
+    require_aer()  # so you get a proper error instead of a raw ImportError
     from qiskit_aer.noise import NoiseModel
 
     reporter.step("verify_start", shots=shots)
     ideal = ideal_distribution(ensure_measured(bound))
-    # One NoiseModel, shared: building it from a 127-qubit backend is the
-    # expensive part, and both paths must be judged by the same noise.
+    # build the noise model once. it's the expensive part on a 127 qubit
+    # backend and both paths have to be judged by the same noise anyway
     noise_model = NoiseModel.from_backend(backend_obj)
     for path in (result.baseline, result.audited):
         fidelity, _counts = simulated_fidelity(
@@ -238,27 +223,27 @@ def calibration(
     console = Console()
     err_console = Console(stderr=True)
     try:
-        snapshot, _ = resolve_calibration(backend)
-        warnings = check_staleness(snapshot, allow_stale=allow_stale)
+        snap, _ = resolve_calibration(backend)
+        warnings = check_staleness(snap, allow_stale=allow_stale)
         if as_json:
-            payload = json.loads(snapshot.model_dump_json())
-            payload["age_hours"] = snapshot.age_hours()
+            payload = json.loads(snap.model_dump_json())
+            payload["age_hours"] = snap.age_hours()
             payload["warnings"] = warnings
             sys.stdout.write(json.dumps(payload, indent=2) + "\n")
             return
-        t2 = sorted(q.t2 for q in snapshot.qubits if q.t2 is not None)
-        console.print(f"[bold]{snapshot.backend_name}[/]  source={snapshot.source}")
-        console.print(f"captured {snapshot.captured_at}  (age {snapshot.age_hours():.1f}h)")
+        t2 = sorted(q.t2 for q in snap.qubits if q.t2 is not None)
+        console.print(f"[bold]{snap.backend_name}[/]  source={snap.source}")
+        console.print(f"captured {snap.captured_at}  (age {snap.age_hours():.1f}h)")
         console.print(
-            f"{snapshot.num_qubits} qubits, {len(snapshot.coupling)} couplers, "
-            f"{len(snapshot.edges)} calibrated 2q directions"
+            f"{snap.num_qubits} qubits, {len(snap.coupling)} couplers, "
+            f"{len(snap.edges)} calibrated 2q directions"
         )
         if t2:
             console.print(
                 f"T2 min/median/max: {t2[0] * 1e6:.1f} / {t2[len(t2) // 2] * 1e6:.1f} / "
                 f"{t2[-1] * 1e6:.1f} us"
             )
-        console.print(f"missing calibration fields: {len(snapshot.missing_fields())}")
+        console.print(f"missing calibration fields: {len(snap.missing_fields())}")
         for warning in warnings:
             console.print(f"[yellow]! {warning}[/]")
     except QAuditError as exc:
@@ -267,7 +252,7 @@ def calibration(
 
 @app.command()
 def version() -> None:
-    """Print version and environment information."""
+    """Print version and environment info."""
     import qiskit
 
     typer.echo(f"q-audit {__version__} (schema {SCHEMA_VERSION})")

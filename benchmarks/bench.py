@@ -1,25 +1,23 @@
 #!/usr/bin/env python
-"""Benchmark harness: does the injected layout actually help, and by how much?
+"""does the injected layout actually help, and by how much.
 
-Two comparisons are reported, because they answer different questions.
+prints two comparisons because they answer different questions.
 
-* **Paired, per seed** -- for each transpiler seed, transpile the circuit both
-  ways and simulate both.  The routing seed is held fixed, so the paired delta
-  isolates the effect of the layout choice.  Reported with a 95% CI over the
-  seed list.  This is the honest statistical claim.
-* **Best of N** -- what a user actually gets from ``q-audit``: the highest-ESP
-  circuit each path produced.  Both paths get the same N and the same seeds.
+paired per seed: for each transpiler seed, transpile both ways and simulate
+both. the routing seed is fixed so the difference is only the layout choice.
+comes with a 95% CI over the seed list. this is the honest statistical claim.
 
-ESP is our model; Hellinger fidelity against an exact statevector reference is
-the independent measurement.  Where they disagree, believe the simulation.
+best of N: what you actually get out of q-audit, ie the highest esp circuit
+each path produced. both paths get the same N and the same seeds.
 
-Usage:
+esp is our model, hellinger fidelity against an exact statevector is the
+independent measurement. if they disagree, believe the simulation.
+
+usage:
     python benchmarks/bench.py --seeds 20 --shots 16384
     python benchmarks/bench.py --alphas 0.1 0.5 1.0 2.0 --circuits ghz7 qft_mirror7
     python benchmarks/bench.py --write-golden
 """
-
-from __future__ import annotations
 
 import argparse
 import json
@@ -29,16 +27,18 @@ import warnings
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
+# run straight from a checkout without installing anything
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT))
 warnings.filterwarnings("ignore")
 
-from benchmarks.circuits import DEFAULT_SUITE, SUITE  # noqa: E402
-from q_audit.calibration import load_fake_backend  # noqa: E402
-from q_audit.feature_extract import extract_features  # noqa: E402
-from q_audit.physics import paired_mean_ci  # noqa: E402
-from q_audit.transpile_audit import (  # noqa: E402
+# imports have to come after the sys.path lines above, ruff will moan
+from benchmarks.circuits import DEFAULT_SUITE, SUITE
+from q_audit.calibration import load_fake_backend
+from q_audit.feature_extract import extract_features
+from q_audit.physics import paired_mean_ci
+from q_audit.transpile_audit import (
     AuditSettings,
     run_audit,
     run_baseline_only,
@@ -50,6 +50,8 @@ GOLDEN_PATH = ROOT / "benchmarks" / "golden.json"
 
 @dataclass
 class CaseResult:
+    """everything we measured for one circuit"""
+
     name: str
     sharp: bool
     note: str
@@ -57,36 +59,26 @@ class CaseResult:
     layout_source: str
     t_est_s: float
     vf2_stop_reason: str
-    baseline_layout: list[int] = field(default_factory=list)
-    audited_layout: list[int] = field(default_factory=list)
-    esp_baseline: list[float] = field(default_factory=list)
-    esp_audited: list[float] = field(default_factory=list)
-    fid_baseline: list[float] = field(default_factory=list)
-    fid_audited: list[float] = field(default_factory=list)
-    esp_control: list[float] = field(default_factory=list)
-    fid_control: list[float] = field(default_factory=list)
+    baseline_layout: list = field(default_factory=list)
+    audited_layout: list = field(default_factory=list)
+    esp_baseline: list = field(default_factory=list)
+    esp_audited: list = field(default_factory=list)
+    fid_baseline: list = field(default_factory=list)
+    fid_audited: list = field(default_factory=list)
+    esp_control: list = field(default_factory=list)
+    fid_control: list = field(default_factory=list)
     control: dict = field(default_factory=dict)
     best: dict = field(default_factory=dict)
     paired: dict = field(default_factory=dict)
     seconds: float = 0.0
 
 
-def _pct(new: float, old: float) -> float | None:
+def _pct(new, old):
     return None if old == 0 else 100.0 * (new / old - 1.0)
 
 
-def run_case(
-    name: str,
-    backend,
-    snapshot,
-    *,
-    seeds: int,
-    shots: int,
-    alpha: float,
-    scaling: str,
-    simulate: bool,
-    control: bool = False,
-) -> CaseResult:
+def run_case(name, backend, snapshot, *, seeds, shots, alpha, scaling,
+             simulate, control=False):
     started = time.monotonic()
     spec = SUITE[name]
     circuit = spec.build()
@@ -218,7 +210,7 @@ def run_case(
     return case
 
 
-def print_summary(cases: list[CaseResult], *, alpha: float, scaling: str) -> None:
+def print_summary(cases, *, alpha, scaling):
     print()
     print(f"=== alpha={alpha}  map_scaling={scaling} ===")
     header = (
@@ -245,7 +237,7 @@ def print_summary(cases: list[CaseResult], *, alpha: float, scaling: str) -> Non
             f"{('yes' if case.sharp else 'NO'):>7}"
         )
     print()
-    print("paired per-seed deltas (95% CI, n = seeds):")
+    print("paired per-seed deltas (95% CI over the seeds):")
     for case in cases:
         paired = case.paired
         line = (
@@ -263,7 +255,7 @@ def print_summary(cases: list[CaseResult], *, alpha: float, scaling: str) -> Non
         print(line)
 
 
-def main() -> int:
+def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--backend", default="fake_sherbrooke")
     parser.add_argument("--seeds", type=int, default=20)
@@ -275,8 +267,8 @@ def main() -> int:
     parser.add_argument(
         "--control",
         action="store_true",
-        help="add a control arm that relocates with Qiskit's own error map "
-        "(no T1/T2 injection), isolating what the injection actually buys",
+        help="add a control arm that relocates using qiskit's own error map, "
+        "so you can see what the T1/T2 injection actually buys",
     )
     parser.add_argument("--out", default=None)
     parser.add_argument("--write-golden", action="store_true")
@@ -292,7 +284,7 @@ def main() -> int:
         f"seeds={args.seeds} shots={args.shots} simulate={not args.no_simulate}"
     )
 
-    payload: dict = {
+    payload = {
         "backend": snapshot.backend_name,
         "calibration_captured_at": snapshot.captured_at.isoformat(),
         "seeds": args.seeds,
@@ -302,7 +294,7 @@ def main() -> int:
 
     for scaling in args.scaling:
         for alpha in args.alphas:
-            cases: list[CaseResult] = []
+            cases = []
             for name in args.circuits:
                 print(f"  [{scaling} alpha={alpha}] {name} ...", flush=True)
                 cases.append(
@@ -341,11 +333,11 @@ def main() -> int:
     return 0
 
 
-def print_control(cases: list[CaseResult]) -> None:
-    """How much of the gain is the T1/T2 injection, and how much is just
-    running a non-strict VF2PostLayout that the preset never runs?"""
+def print_control(cases):
+    """how much of the gain is the T1/T2, and how much is just running a
+    non-strict VF2PostLayout that the preset never runs on its own"""
     print()
-    print("control arm (same relocation, Qiskit's own error map -- no injection):")
+    print("control arm (same relocation, qiskit's own error map, no injection):")
     header = (
         f"  {'circuit':<18}{'ESP base':>10}{'ESP ctrl':>10}{'ESP aud':>10}"
         f"{'ctrl vs base':>14}{'aud vs ctrl':>13}{'dF aud-ctrl':>14}"
@@ -366,8 +358,8 @@ def print_control(cases: list[CaseResult]) -> None:
         )
 
 
-def _print_sweep(payload: dict) -> None:
-    print("\n=== sweep summary: mean paired fidelity delta by (scaling, alpha) ===")
+def _print_sweep(payload):
+    print("\n=== sweep: mean paired fidelity delta per (scaling, alpha) ===")
     print(f"{'scaling':<14}{'alpha':>7}{'mean dF':>12}{'mean dESP':>12}{'sig cases':>11}")
     for run in payload["runs"]:
         sharp = [c for c in run["cases"] if c["sharp"] and c["fid_baseline"]]
@@ -382,9 +374,9 @@ def _print_sweep(payload: dict) -> None:
         )
 
 
-def _golden_view(payload: dict) -> dict:
-    """Trim to the numbers a regression gate should watch."""
-    out: dict = {
+def _golden_view(payload):
+    """cut it down to just the numbers a regression gate should watch"""
+    out = {
         "backend": payload["backend"],
         "seeds": payload["seeds"],
         "shots": payload["shots"],

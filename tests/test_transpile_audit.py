@@ -1,6 +1,4 @@
-"""Orchestration: fairness of the paired comparison, layout validity, settings."""
-
-from __future__ import annotations
+"""the orchestration bits: is the comparison actually fair, are the layouts real"""
 
 import pytest
 
@@ -9,7 +7,7 @@ from q_audit.transpile_audit import AuditSettings, run_audit
 
 pytestmark = pytest.mark.slow
 
-SEEDS = 3  # keep the suite quick; fairness properties do not depend on N
+SEEDS = 3  # keep it quick, the fairness stuff doesn't depend on how many seeds
 
 
 @pytest.fixture(scope="module")
@@ -29,7 +27,7 @@ def audit(request):
 
 
 def test_seed_lists_are_identical(audit):
-    """The comparison is invalid the moment the two paths get different budgets."""
+    """the whole comparison is junk if the two paths get different budgets"""
     result, _ = audit
     baseline_seeds = [m.seed for m in result.baseline.all_metrics]
     audited_seeds = [m.seed for m in result.audited.all_metrics]
@@ -57,7 +55,7 @@ def test_layouts_are_valid_physical_qubits(audit, snapshot):
 
 
 def test_audited_layout_is_actually_used(audit):
-    """The pinned layout must survive the pass manager, not be re-chosen."""
+    """the pinned layout has to survive the pass manager and not get re-picked"""
     result, _ = audit
     assert set(result.audited.best.layout) == set(result.layout_info["final_layout"])
 
@@ -94,7 +92,7 @@ def test_audited_is_the_best_available_strategy(audit):
 
 
 def test_relocation_preserves_routing_cost(audit):
-    """The relocate strategy must not change gate structure, only placement."""
+    """relocating should move qubits around and change nothing else"""
     from q_audit.transpile_audit import STRATEGY_RELOCATE
 
     result, _ = audit
@@ -103,8 +101,8 @@ def test_relocation_preserves_routing_cost(audit):
         pytest.skip("relocation disabled")
     for base, moved in zip(result.baseline.all_metrics, relocated.all_metrics):
         assert moved.swap_gates == base.swap_gates
-        # Direction fix-up may add 1q gates around a flipped 2q gate, but the
-        # two-qubit count is fixed by the routing we inherited.
+        # the direction fixup can add 1q gates around a flipped 2q gate, but
+        # the 2q count comes from the routing we inherited so it can't move
         assert moved.two_qubit_gates == base.two_qubit_gates
 
 
@@ -119,15 +117,13 @@ def test_recommendation_matches_the_numbers(audit):
 
 
 def test_metrics_are_reproducible(snapshot, fake_backend, ghz7):
-    """Same inputs, same seeds -> the same reported answer.
+    """same inputs and same seeds should give the same answer.
 
-    Note what is *not* asserted: per-seed equality. Qiskit 2.5.1's preset pass
-    manager is itself non-deterministic at optimization_level 2 and 3 even with
-    a fixed ``seed_transpiler`` (see
-    ``test_qiskit_preset_is_not_bit_reproducible_at_o3``), so an individual
-    seed's circuit can differ between runs through no fault of ours. The
-    user-visible headline -- best-of-N and the layout it picked -- is what must
-    hold, and does.
+    note what this does NOT check: per seed equality. qiskit 2.5.1's preset
+    pass manager isn't deterministic at opt level 2 and 3 even with a fixed
+    seed_transpiler (see test_qiskit_preset_is_not_bit_reproducible_at_o3), so
+    one seed's circuit can change between runs and it's not our fault. what has
+    to hold is the headline, best of N and the layout it picked
     """
     bound, unrolled, features = extract_features(ghz7, snapshot)
     settings = AuditSettings(seeds=2)
@@ -148,7 +144,7 @@ def test_raw_and_normalized_scaling_both_run(snapshot, fake_backend, ghz7):
         )
         results[scaling] = result
         assert result.error_map.scaling == scaling
-    # They are different objectives, so they may disagree -- both must be valid.
+    # different objectives so they can disagree, but both have to be valid
     for result in results.values():
         assert 0.0 < result.audited.best.esp <= 1.0
 
@@ -167,7 +163,7 @@ def test_post_layout_refinement_can_be_disabled(snapshot, fake_backend, ghz7):
 
 
 def test_relocate_only_when_vf2_cannot_embed(snapshot, fake_backend):
-    """A dense circuit has no exact embedding; the relocate strategy carries it."""
+    """dense circuit has no exact embedding so relocate has to carry it"""
     from qiskit import QuantumCircuit
 
     from q_audit.transpile_audit import STRATEGY_PINNED, STRATEGY_RELOCATE
@@ -203,14 +199,14 @@ def test_circuit_wider_than_device_is_rejected(snapshot, fake_backend):
 @pytest.mark.aer
 @pytest.mark.parametrize("builder", ["ghz", "dense"])
 def test_audited_circuit_computes_the_same_thing(snapshot, fake_backend, builder):
-    """THE load-bearing invariant.
+    """the most important test in here.
 
-    Relocating a routed circuit permutes physical qubits under it. If that
-    permutation were not composed correctly into the layout -- or if the
-    measure-to-clbit mapping did not follow -- every fidelity number this tool
-    reports would be measuring the wrong circuit, and it would look like a
-    *better* result rather than a broken one. So: simulate both paths with no
-    noise at all and demand they reproduce the ideal distribution.
+    relocating a routed circuit permutes the physical qubits under it. if that
+    permutation doesn't get composed into the layout properly, or the measure
+    to clbit mapping doesn't follow it, then every fidelity number this tool
+    prints is measuring the wrong circuit. and the scary part is it would look
+    like a BETTER result, not a broken one. so simulate both paths with zero
+    noise and make them reproduce the ideal distribution
     """
     pytest.importorskip("qiskit_aer")
     from qiskit import QuantumCircuit
@@ -224,7 +220,7 @@ def test_audited_circuit_computes_the_same_thing(snapshot, fake_backend, builder
         qc.h(0)
         for i in range(6):
             qc.cx(i, i + 1)
-    else:  # forces routing, so the relocate strategy is exercised
+    else:  # forces routing so the relocate path gets exercised
         qc = QuantumCircuit(6, name="dense6")
         for i in range(6):
             for j in range(i + 1, 6):
@@ -236,7 +232,7 @@ def test_audited_circuit_computes_the_same_thing(snapshot, fake_backend, builder
         bound, unrolled, features, snapshot, fake_backend, AuditSettings(seeds=2)
     )
     ideal = ideal_distribution(ensure_measured(bound))
-    simulator = AerSimulator()  # noiseless on purpose
+    simulator = AerSimulator()  # no noise model, on purpose
 
     for path in (result.baseline, result.audited):
         counts = simulator.run(
@@ -250,20 +246,17 @@ def test_audited_circuit_computes_the_same_thing(snapshot, fake_backend, builder
 
 
 def test_qiskit_preset_is_not_bit_reproducible_at_o3(fake_backend):
-    """Documents an upstream defect that bounds what q-audit can promise.
+    """this one documents a qiskit bug, not ours.
 
-    ``generate_preset_pass_manager(optimization_level=3, seed_transpiler=42)``
-    run repeatedly on the same circuit in the same process returns more than one
-    distinct result on Qiskit 2.5.1 -- different layouts *and* different depths.
-    optimization_level=1 does not do this, so it is something in the O2/O3
-    optimization loop, not the layout or routing passes (each is deterministic
-    in isolation).
+    generate_preset_pass_manager(optimization_level=3, seed_transpiler=42) run
+    over and over on the same circuit in the same process gives back more than
+    one answer on qiskit 2.5.1, different layouts and different depths. opt
+    level 1 doesn't do it, so it's something in the O2/O3 optimization loop and
+    not the layout or routing passes, those are each deterministic on their own.
 
-    This test asserts only what is stable: every result is a valid ISA circuit
-    on the same qubit count. It exists so that a future reader who sees q-audit
-    report slightly different per-seed numbers between runs looks upstream
-    instead of hunting a bug here. If Qiskit fixes this, the observation below
-    collapses to a single variant and the test still passes.
+    i spent a whole evening thinking i had a bug before working this out, hence
+    the test. it only asserts what's actually stable (valid ISA circuit, right
+    qubit count) so if qiskit ever fixes it this still passes
     """
     from qiskit.transpiler import generate_preset_pass_manager
 
@@ -283,5 +276,5 @@ def test_qiskit_preset_is_not_bit_reproducible_at_o3(fake_backend):
                 transpiled.depth(),
             )
         )
-    # Not an assertion about the count -- just a guard that nothing exploded.
+    # not asserting the count, just that nothing exploded
     assert 1 <= len(seen) <= 6
