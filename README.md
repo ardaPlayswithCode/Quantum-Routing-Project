@@ -4,10 +4,14 @@ transpiles a circuit twice against the same backend and shows you both side by
 side: once with stock qiskit (`optimization_level=3`) and once with a T1/T2
 aware error map injected into vf2's layout scoring.
 
-the point is that qiskit's layout scoring uses gate error and readout error but
-doesn't know about coherence times. a qubit with a 2.6us T2 has dephased long
-before a 30us circuit finishes, and nothing in the default pipeline notices.
-this measures what that costs you.
+qiskit's layout scoring uses gate error and readout error but doesn't look at
+coherence times. this charges each qubit for the time it sits idle using T1/T2,
+and keeps whichever layout scores higher. it only changes which physical qubits
+get used. stock sabre still does the routing.
+
+status: simulation only. i have never run it on real hardware, and the live
+backend path is untested. it's a side project i plan to extend into research on
+the layout/routing layer.
 
 ## install
 
@@ -52,7 +56,7 @@ eps_idle(t) = (3 - 2*exp(-t/T2) - exp(-t/T1)) / 6
 ```
 
 which is the standard thermal relaxation infidelity. it matches aer's
-`thermal_relaxation_error` to machine precision, there's a test for that. only
+`thermal_relaxation_error` to within 1e-12, there's a test for that. only
 idle gaps get charged, gate errors from calibration already include whatever
 decohered during the gate. estimated success probability is then just
 `prod(1 - eps)` over everything.
@@ -69,9 +73,16 @@ list and the same objective, otherwise the comparison would be meaningless.
 
 ## results
 
-short version: +0.8% to +3.3% hellinger fidelity depending on the circuit, on
-20 paired seeds against an exact statevector reference. see RESULTS.md for the
-numbers and the control arm, which is the part i'd actually look at.
+on `fake_sherbrooke`, best-of-20 hellinger fidelity gains range from +0.8% to
++3.3% across 6 of 7 benchmark circuits, measured against the ideal output
+distribution with paired seeds and 95% CIs (see RESULTS.md). qft7 shows no
+change because its output is near uniform, so there's nothing to improve.
+
+these are small gains on one simulated chip, and not a general claim. most of
+the gain also shows up with the idle term turned off (alpha=0, +1.8 points mean
+paired fidelity vs +2.3 at alpha=1), so the T1/T2 term accounts for only a part
+of it. the rest comes from how the layout is scored and relocated. the control
+arm in RESULTS.md separates the two, and it's the part i'd actually look at.
 
 ## what doesn't work / caveats
 
